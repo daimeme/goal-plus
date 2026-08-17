@@ -261,7 +261,12 @@ def create_mcp(
         tool_id: str,
         snapshot_hash: str,
     ) -> dict[str, Any]:
-        """复制一个已绑定 Tool View 的共享工具到候选临时 inbox。"""
+        """按精确 id/hash 复制已绑定 Tool View 的快照，供阅读源码或自主复用。
+
+        复制不要求调用原工具。只有直接执行、导入或依赖原快照时，才先在当前
+        workspace 验证入口、依赖、路径假设和输出语义。下一次 worker verifier
+        会消费 receipt；当前 adopted_tools 只证明快照曾复制进本轮上下文。
+        """
         return tools.search_copy_shared_tool(agent_session_id, tool_id, snapshot_hash)
 
     @mcp.tool()
@@ -271,11 +276,24 @@ def create_mcp(
         summary: str,
         entrypoint: str,
         candidate_relative_source_paths: list[str],
+        publication_intent: Literal[
+            "new", "capability_extension", "adoption_fix", "contract_change"
+        ] = "new",
+        supersedes_tool_id: str | None = None,
+        capability_ids: list[str] | None = None,
+        coverage_keys: list[str] | None = None,
     ) -> dict[str, Any]:
         """将显式的 candidate tool drafts 安全复制到下一次 verifier staging。
 
-        source paths 必须位于当前 candidate 的 `.tmp/tool-drafts/` 下。该工具只执行
-        staging；只有归属于当前 worker 且通过的 process verifier 才能发布快照。
+        source paths 必须位于当前 candidate 的 `.tmp/tool-drafts/` 下。首次发布使用
+        publication_intent=new。搜索期间的测试/checker/harness 可以 staging；candidate
+        最终交付测试、冻结 verifier/runner/grader、隐藏答案或评分逻辑不可 staging。
+        family 更新仅在 tool_family_catalog 的
+        revision_allowed=true 时引用 revision_head.tool_id：capability_extension 必须
+        新增稳定 capability/coverage key；adoption_fix 必须有同 family 的真实
+        copy/adoption 事实和具体缺陷；contract_change 必须为有价值的入口、输入、输出
+        或依赖变化新增稳定契约键。不得靠改名或同义键制造增量。该工具只执行 staging；
+        只有归属于当前 worker 且通过的 process verifier 才能发布快照。
         """
         return tools.search_stage_shared_tool(
             agent_session_id,
@@ -283,6 +301,10 @@ def create_mcp(
             summary,
             entrypoint,
             candidate_relative_source_paths,
+            publication_intent,
+            supersedes_tool_id,
+            capability_ids,
+            coverage_keys,
         )
 
     @mcp.tool()

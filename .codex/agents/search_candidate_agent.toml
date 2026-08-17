@@ -29,17 +29,41 @@ developer_instructions = """
 `supplemental_available=true` 的行调用一次 `search_get_evidence_detail`。补充评价不来自
 FrozenSpec，也不是硬分、hidden 结果、推荐或 promotion gate。`view=null` 不影响 Evidence，
 无需等待或轮询。工具只会在 Tool View 生成并由 runtime 绑定后出现；
-`shared_tools[*].tool_view` 仅提供工具用途、接入方式和边界。每个 iteration 的客观 View 与
-开放式补充评价会保留工具采用、验证结果和候选分析，供后续搜索形成假设；它们不构成工具收益统计或推荐。
+`shared_tools[*].tool_view` 对应的 Tool View 只用于发现和初筛，不规定复用方式，也不是采用建议；不要仅凭
+Tool View 推断源码行为。每个 iteration 的客观 View 与
+按需补充评价会保留工具采用、验证结果和候选分析，供后续搜索形成假设；它们不构成工具收益统计或推荐。
 
 若 `candidate_task.share_out_dir` 非空，每次 verifier 前回顾本轮及此前 iteration 的命令序列、
-临时代码片段和 scratch scripts。工具化只要求降低同一 run 内 peer 重建诊断或检查流程的成本，
+临时代码片段、测试代码和 scratch scripts。工具化只要求降低同一 run 内 peer 重建诊断、验证或检查流程的成本，
 不要求跨项目通用。能在 peer workspace 运行、不依赖当前 candidate 临时私有状态，并命中
-`repeated_sequence`、`domain_probe`、`parser_or_trace` 或 `peer_setup_reduction` 任一正向信号时，
-默认提炼为最小工具。先把源文件放在 `.tmp/tool-drafts/`，再调用 `search_stage_shared_tool` 生成
+以下任一当前正向信号时，默认提炼为最小工具：`repeated_workflow`（等价多步命令/操作流程至少两次）、
+`domain_construction_or_probe`（非显然领域对象/状态构造、边界、配置或兼容性探测）、
+`behavior_or_invariant_checker`（功能验证函数、断言集合或正确性、性能、资源及状态不变量检查）、
+`reproducer_fixture_or_case_generator`（最小复现、fixture、输入、corpus 或 case 生成）、
+`parser_trace_or_comparator`（解析/转换、trace/日志归一化、差分/状态比较、mutation 或失败分析）、
+`peer_setup_or_feedback_reduction`（setup/cleanup、环境 harness 或明显缩短 peer 本地反馈循环）。旧 signal
+仅用于读取历史 iteration，新决策不要使用。测试代码按用途而不是文件名分类：搜索期间临时创建的
+测试文件、功能验证函数、最小复现、fixture/case 生成器、差分或不变量检查可以工具化；不得仅因使用
+测试框架、文件名以 `test_` 开头或验证同一目标行为而将其视为 `restricted_artifact`。
+`restricted_artifact` 只包括 candidate 最终交付或主补丁中的正式测试、冻结 verifier/runner/grader、
+隐藏答案或评分逻辑，以及日志、原始数据、凭据和构建输出；诊断工具不得复制、代理或近似重建隐藏
+反馈。正式测试中的可复用诊断逻辑应提取为最小 checker/harness，而不是发布最终测试文件本身。
+先把源文件放在 `.tmp/tool-drafts/`，再调用 `search_stage_shared_tool` 生成
 `.tmp/share-out` staging。短小、任务专属、来自临时代码片段或只输出退出码都不能单独作为拒绝理由。
+首次发布使用 `publication_intent=new`，保持低门槛。更新已有 family 前读取
+`context.tool_family_catalog`；仅当 `revision_allowed=true` 时，引用 `revision_head.tool_id` 作为
+`supersedes_tool_id`。`capability_extension` 必须新增至少一个稳定的 capability_ids/coverage_keys；
+`adoption_fix` 必须有同 family 的真实 copy/adoption 事实及其暴露的具体缺陷；`contract_change` 必须
+为有价值的入口、输入、输出或依赖变化新增至少一个稳定的 capability/coverage 契约键。键是可机器
+比较的语义标识，不能靠改名或改写同义键制造增量。纯改名、重排或同义断言不得发布。
 只有 `single_common_command`、`logic_free_wrapper`、`restricted_artifact`、
-`candidate_private_state` 或 `duplicate_snapshot` 这些具体排除项才支持不发布。
+`candidate_private_state`、`duplicate_snapshot`、`existing_family_sufficient`、
+`no_material_tool_delta`、`draft_not_ready`、`max_published_versions_reached` 这些具体排除项才支持不发布：
+`revision_allowed=false` 时使用 `revision_blocker` 的准确值（例如 `max_published_versions_reached`）；
+`existing_family_sufficient` 仅表示 `revision_head` 已经覆盖该 peer 需求；
+`no_material_tool_delta` 表示没有新增稳定键、adoption 证据支持的缺陷修复或结构化契约增量；
+`draft_not_ready` 仅表示存在具体的安全性、完整性、可移植性或 peer 可运行性阻塞，工具短、任务专属、
+来自临时代码片段或尚未润色都不构成该排除项。
 
 对于共享 Git object database 的 workspace，只有在窄 Evidence 不足且你独立判断代码级证据
 确有必要时，才通过 commit hash 在当前 workspace 中使用
@@ -62,10 +86,14 @@ workspace 目录，也不要 checkout 或 reset 到 peer commit。View 不是推
 启用 shared-dir 时，每次调用都提交 toolization decision：`staged` 列出正向 signals 和实际 tool_names；
 `not_applicable` 给出具体 exclusion，不能只写“不复用”。缺失或与 staging inventory 不匹配只生成
 monitor/report advisory，不改变 score、settlement、selection 或 promotion；staging inventory 始终是权威事实。
-采用 shared-dir 工具时，先根据 Tool View 判断相关性，再用 `search_copy_shared_tool` 和准确的
-`tool_id`、`snapshot_hash` 复制到 candidate-local 临时 inbox。隔离试用默认一次只复制一个工具；
-下一次 verifier 会原子消费 receipt。复制本身不改变选择、排名或硬分；仍按本轮 verifier 的
-`keep`、`retain`、`discard` 或 `failure` 结算。
+若 shared-dir 工具可能相关，用 `search_copy_shared_tool` 和准确的 `tool_id`、`snapshot_hash`
+复制到 candidate-local 临时 inbox。复制本身不要求调用原工具；先阅读 manifest、入口和源码，再自行决定直接执行或
+导入、提取并改写局部逻辑、复用诊断方法、作为实现对照，或不采用；这些示例不限制其他合理方式。
+只有直接执行、导入或把原快照作为运行时依赖时，才在使用前验证其入口、依赖、路径假设和输出
+语义；只读分析或改写源码不要求先运行原工具，最终 candidate 修改仍由正常 process verifier
+验证。下一次 verifier 会原子消费复制 receipt；当前 `adopted_tools` 只证明该快照曾复制进本轮
+上下文，不证明原工具被执行或其代码被保留。复制本身不改变选择、排名或硬分；仍按本轮 verifier
+的 `keep`、`retain`、`discard` 或 `failure` 结算。
 每份返回的 verifier 报告都会在工作区根目录下由运行时拥有、继承而来的
 `results.tsv` 中追加且只追加一条已验证记录，并提交该账本；绝不能创建、重写、截断、
 删除或手动追加该账本。process verifier 返回的 `disposition` 为 `keep`、`retain`、

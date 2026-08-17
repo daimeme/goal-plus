@@ -66,10 +66,12 @@ SharedToolPublishStatus = Literal[
     "snapshot_error",
 ]
 ToolizationSignal = Literal[
-    "repeated_sequence",
-    "domain_probe",
-    "parser_or_trace",
-    "peer_setup_reduction",
+    "repeated_workflow",
+    "domain_construction_or_probe",
+    "behavior_or_invariant_checker",
+    "reproducer_fixture_or_case_generator",
+    "parser_trace_or_comparator",
+    "peer_setup_or_feedback_reduction",
 ]
 ToolizationExclusion = Literal[
     "single_common_command",
@@ -77,6 +79,10 @@ ToolizationExclusion = Literal[
     "restricted_artifact",
     "candidate_private_state",
     "duplicate_snapshot",
+    "existing_family_sufficient",
+    "no_material_tool_delta",
+    "draft_not_ready",
+    "max_published_versions_reached",
 ]
 ToolizationAdvisory = Literal[
     "toolization_review_missing",
@@ -561,6 +567,13 @@ class VerifierCommand(SearchModel):
 class SharedDirSpec(SearchModel):
     enabled: bool = False
     max_tools_per_iteration: int = Field(default=16, gt=0, le=128)
+    max_pending_revisions_per_family: int = Field(default=1, ge=1, le=1)
+    max_published_versions_per_family: int = Field(
+        default=2,
+        ge=1,
+        le=32,
+        description="Maximum immutable published records retained per family.",
+    )
     max_files_per_iteration: int = Field(default=64, gt=0, le=512)
     max_path_entries_per_iteration: int = Field(default=512, gt=0, le=8192)
     max_depth: int = Field(default=8, ge=1, le=32)
@@ -788,8 +801,22 @@ class FrozenSpec(SearchModel):
     created_at: str
 
 
+ToolPublicationIntent = Literal[
+    "new",
+    "capability_extension",
+    "adoption_fix",
+    "contract_change",
+]
+
+
 class SharedToolRecord(SearchModel):
     tool_id: str = Field(min_length=1)
+    family_id: str = Field(min_length=1)
+    version: int = Field(ge=1)
+    publication_intent: ToolPublicationIntent = "new"
+    supersedes_tool_id: str | None = None
+    capability_ids: list[str] = Field(default_factory=list, max_length=32)
+    coverage_keys: list[str] = Field(default_factory=list, max_length=64)
     candidate_id: str = Field(min_length=1)
     iteration: int = Field(ge=1)
     source_commit: str | None = None
@@ -811,6 +838,45 @@ class SharedToolRecord(SearchModel):
         payload = dict(value)
         payload["tool_id"] = payload.pop("asset_id")
         return payload
+
+    @model_validator(mode="before")
+    @classmethod
+    def infer_legacy_family(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or "family_id" in value:
+            return value
+        payload = dict(value)
+        tool_id = payload.get("tool_id") or payload.get("asset_id")
+        if isinstance(tool_id, str) and tool_id:
+            payload["family_id"] = f"legacy-{tool_id}"
+            payload["version"] = 1
+            payload["publication_intent"] = "new"
+        return payload
+
+    @field_validator("capability_ids", "coverage_keys", mode="before")
+    @classmethod
+    def normalize_tool_keys(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            return value
+        normalized: list[Any] = []
+        for item in value:
+            if not isinstance(item, str):
+                normalized.append(item)
+                continue
+            key = " ".join(item.strip().split())
+            if not key or len(key) > 160:
+                raise ValueError("tool capability and coverage keys must contain 1-160 characters")
+            normalized.append(key)
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("tool capability and coverage keys must be unique")
+        return normalized
+
+
+class SharedToolFamily(SearchModel):
+    family_id: str = Field(min_length=1)
+    pending_head: str | None = None
+    discoverable_head: str | None = None
+    created_at: str
+    updated_at: str
 
 
 class CandidateTask(SearchModel):
@@ -897,7 +963,11 @@ class VerifierResult(SearchModel):
 
 class ToolizationDecision(SearchModel):
     outcome: Literal["staged", "not_applicable"]
-    signals: list[ToolizationSignal] = Field(default_factory=list, max_length=4)
+    signals: list[ToolizationSignal] = Field(
+        default_factory=list,
+        max_length=6,
+        description="Use the six capability-oriented toolization signals.",
+    )
     exclusion: ToolizationExclusion | None = None
     rationale: str = Field(min_length=1, max_length=1000)
     tool_names: list[str] = Field(default_factory=list, max_length=16)

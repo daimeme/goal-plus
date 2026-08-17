@@ -176,6 +176,10 @@ class SearchTools:
         summary: str,
         entrypoint: str,
         candidate_relative_source_paths: list[str],
+        publication_intent: str = "new",
+        supersedes_tool_id: str | None = None,
+        capability_ids: list[str] | None = None,
+        coverage_keys: list[str] | None = None,
     ) -> dict[str, Any]:
         return self.runtime.stage_shared_tool(
             agent_session_id=agent_session_id,
@@ -183,6 +187,10 @@ class SearchTools:
             summary=summary,
             entrypoint=entrypoint,
             candidate_relative_source_paths=candidate_relative_source_paths,
+            publication_intent=publication_intent,
+            supersedes_tool_id=supersedes_tool_id,
+            capability_ids=capability_ids,
+            coverage_keys=coverage_keys,
         )
 
     def search_get_evidence_detail(

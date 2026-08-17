@@ -273,6 +273,10 @@ def test_codex_worker_agent_calls_context_and_verifier() -> None:
     text = (ROOT / ".codex" / "agents" / "search_candidate_agent.toml").read_text(
         encoding="utf-8"
     )
+    exclusion_clause = text.split("只有 `single_common_command`", 1)[1].split(
+        "这些具体排除项才支持不发布", 1
+    )[0]
+    exclusions = ["single_common_command", *exclusion_clause.split("`")[1::2]]
 
     assert 'name = "search_candidate_agent"' in text
     assert "search_get_agent_context" in text
@@ -292,17 +296,71 @@ def test_codex_worker_agent_calls_context_and_verifier() -> None:
     assert "search_copy_shared_tool" in text
     assert "search_stage_shared_tool" in text
     assert ".tmp/tool-drafts" in text
-    assert "repeated_sequence" in text
-    assert "domain_probe" in text
-    assert "parser_or_trace" in text
-    assert "peer_setup_reduction" in text
+    assert "repeated_workflow" in text
+    assert "domain_construction_or_probe" in text
+    assert "behavior_or_invariant_checker" in text
+    assert "reproducer_fixture_or_case_generator" in text
+    assert "parser_trace_or_comparator" in text
+    assert "peer_setup_or_feedback_reduction" in text
+    assert "repeated_sequence" not in text
+    assert "domain_probe" not in text
+    assert "parser_or_trace" not in text
+    assert "peer_setup_reduction" not in text
+    assert "旧 signal" in text
+    assert "测试代码按用途而不是文件名分类" in text
+    assert "临时创建的" in text
+    assert "测试文件、功能验证函数" in text
+    assert "文件名以 `test_` 开头或验证同一目标行为" in text
+    assert "candidate 最终交付或主补丁中的正式测试" in text
+    assert "冻结 verifier/runner/grader" in text
+    assert "隐藏答案或评分逻辑" in text
+    assert "不得复制、代理或近似重建隐藏" in text
     assert "not_applicable" in text
+    assert "revision_allowed=true" in text
+    assert "revision_head.tool_id" in text
+    assert "revision_allowed=false` 时使用 `revision_blocker` 的准确值" in text
+    assert "max_published_versions_reached" in text
+    assert exclusions == [
+        "single_common_command",
+        "logic_free_wrapper",
+        "restricted_artifact",
+        "candidate_private_state",
+        "duplicate_snapshot",
+        "existing_family_sufficient",
+        "no_material_tool_delta",
+        "draft_not_ready",
+        "max_published_versions_reached",
+    ]
+    assert "capability_extension` 必须新增至少一个稳定" in text
+    assert "adoption_fix` 必须有同 family 的真实 copy/adoption 事实" in text
+    assert "contract_change` 必须" in text
+    assert "新增至少一个稳定的 capability/coverage 契约键" in text
+    assert "键是可机器" in text
+    assert "draft_not_ready` 仅表示存在具体的安全性" in text
+    assert "pending_head` 或 `discoverable_head" not in text
     assert "staging inventory 始终是权威事实" in text
     assert "required-column-probe" not in text
     assert "mutation-check-trace" not in text
     assert "Astropy" not in text
     assert "receipt" in text
     assert "shared_tools[*].tool_view" in text
+    assert "Tool View 推断源码行为" in text
+    assert "Tool View 只用于发现和初筛" in text
+    assert "不规定复用方式，也不是采用建议" in text
+    assert "复制本身不要求调用原工具" in text
+    assert "先阅读 manifest、入口和源码" in text
+    assert "直接执行或" in text
+    assert "提取并改写局部逻辑" in text
+    assert "复用诊断方法" in text
+    assert "作为实现对照" in text
+    assert "或不采用" in text
+    assert "这些示例不限制其他合理方式" in text
+    assert "只有直接执行、导入或把原快照作为运行时依赖时" in text
+    assert "只读分析或改写源码不要求先运行原工具" in text
+    assert "最终 candidate 修改仍由正常 process verifier" in text
+    assert "当前 `adopted_tools` 只证明该快照曾复制进本轮" in text
+    assert "不证明原工具被执行或其代码被保留" in text
+    assert "隔离试用默认一次只复制一个工具" not in text
     assert "git diff HEAD <commit> -- <allowed-file>" in text
     assert "一条自主 Search 循环" in text
     assert "不要等待父 agent 选择方向" in text
@@ -315,6 +373,10 @@ def test_codex_search_reuses_exact_worker_evidence_before_parent_verification() 
     text = (ROOT / ".codex" / "skills" / "search" / "SKILL.md").read_text(
         encoding="utf-8"
     )
+    exclusion_clause = text.split("只有 `single_common_command`", 1)[1].split(
+        "这些具体排除项才支持 `not_applicable`", 1
+    )[0]
+    exclusions = ["single_common_command", *exclusion_clause.split("`")[1::2]]
 
     assert "准确 worker Evidence" in text
     assert "仅在没有匹配 Evidence 时" in text
@@ -324,7 +386,50 @@ def test_codex_search_reuses_exact_worker_evidence_before_parent_verification() 
     assert "search_copy_shared_tool" in text
     assert "search_stage_shared_tool" in text
     assert "toolization_decision" in text
+    assert "repeated_workflow" in text
+    assert "domain_construction_or_probe" in text
+    assert "behavior_or_invariant_checker" in text
+    assert "reproducer_fixture_or_case_generator" in text
+    assert "parser_trace_or_comparator" in text
+    assert "peer_setup_or_feedback_reduction" in text
+    assert "repeated_sequence" not in text
+    assert "domain_probe" not in text
+    assert "parser_or_trace" not in text
+    assert "peer_setup_reduction" not in text
+    assert "测试代码按用途而不是文件名分类" in text
+    assert "测试文件、功能验证函数" in text
+    assert "`test_` 文件名或验证同一目标行为都不是 `restricted_artifact` 理由" in text
+    assert "candidate 最终交付或主补丁中的正式测试" in text
+    assert "冻结 verifier/runner/grader" in text
+    assert "隐藏答案或评分逻辑" in text
+    assert "不得复制、代理或近似重建隐藏反馈" in text
+    assert "revision_allowed=true" in text
+    assert "revision_head.tool_id" in text
+    assert "revision_allowed=false` 时使用 `revision_blocker` 的准确值" in text
+    assert exclusions == [
+        "single_common_command",
+        "logic_free_wrapper",
+        "restricted_artifact",
+        "candidate_private_state",
+        "duplicate_snapshot",
+        "existing_family_sufficient",
+        "no_material_tool_delta",
+        "draft_not_ready",
+        "max_published_versions_reached",
+    ]
+    assert "capability_extension` 必须新增稳定" in text
+    assert "adoption_fix` 必须有同 family 的真实 copy/adoption 事实" in text
+    assert "contract_change` 必须" in text
+    assert "新增稳定的契约键" in text
+    assert "不能靠改名或改写同义键" in text
+    assert "draft_not_ready` 仅表示具体的安全性" in text
     assert "receipt" in text
+    assert "Tool View 只用于发现和初筛" in text
+    assert "不规定复用方式，也不是采用建议" in text
+    assert "复制本身不要求调用原工具" in text
+    assert "先阅读 manifest、入口和源码" in text
+    assert "只读分析或改写源码不要求先运行原工具" in text
+    assert "当前 `adopted_tools` 只证明该快照曾复制进" in text
 
 
 def test_codex_search_uses_open_posthoc_evaluation_as_non_gating_feedback() -> None:

@@ -134,11 +134,45 @@ candidate 不需要在修改前提交 iteration plan。`hypothesis` 是完成尝
 自述，与 verifier 结果一起保存；它不是 pending plan，也不形成协调锁。多个
 candidate 可以同时读取同一版 Evidence 并并发工作。
 
-工具化的正向信号是：重复或等价的多步流程、非显然领域对象/边界/断言检查、解析/trace/
-复现/转换/mutation 检查，以及明显降低 peer 重建成本的流程。复用范围只要求同一 run 内的
-其他 candidate 有用，不要求跨项目通用；短小、任务专属、来自临时代码片段或只输出退出码
-都不能单独作为低价值理由。只有单条普通命令、无逻辑 wrapper、受限产物、依赖 candidate
-私有状态或与已发布快照完全相同才是具体排除项。
+当前工具化信号按能力分为六类：`repeated_workflow`（重复或等价的多步命令/操作流程）、
+`domain_construction_or_probe`（非显然领域对象/状态构造、边界、配置或兼容性探测）、
+`behavior_or_invariant_checker`（功能验证、断言或正确性、性能、资源及状态不变量检查）、
+`reproducer_fixture_or_case_generator`（最小复现、fixture、输入、corpus 或 case 生成）、
+`parser_trace_or_comparator`（解析/转换、trace/日志归一化、差分/状态比较、mutation 或失败分析）和
+`peer_setup_or_feedback_reduction`（setup/cleanup、环境 harness 或缩短 peer 本地反馈循环）。复用范围
+只要求同一 run 内的其他 candidate 有用，不要求跨项目通用；短小、任务专属、来自临时代码片段或只输出退出码都不能单独
+作为低价值理由。
+
+测试代码按用途而不是路径、文件名或框架分类。搜索期间创建的测试文件、功能验证函数、最小复现、
+fixture/case 生成器、差分或不变量检查可以作为工具；`test_` 文件名、使用测试框架或验证同一目标
+行为都不是 `restricted_artifact` 理由。该排除项只覆盖 candidate 最终交付或主补丁中的正式测试、
+冻结 verifier/runner/grader、隐藏答案或评分逻辑，以及日志、原始数据、凭据和构建输出。诊断工具
+不得复制、代理或近似重建隐藏反馈；正式测试中的可复用诊断逻辑应提取为最小 checker/harness，
+而不是发布最终测试文件本身。其他具体排除项仍包括单条普通命令、无逻辑 wrapper、依赖 candidate
+私有状态或与已发布快照完全相同。
+
+首次工具发布保持低门槛，短小 inline probe 仍可进入共享面。每个不可变 `SharedToolRecord`
+同时绑定 runtime 分配的 `family_id` 与递增 `version`。worker 仅在 catalog 的
+`revision_allowed=true` 时引用唯一的 `revision_head.tool_id` 更新已有 family。
+`capability_extension` 必须新增稳定 capability/coverage key；`adoption_fix` 必须有同 family 的真实
+copy/adoption 事实和具体缺陷；`contract_change` 必须为有价值的入口、输入、输出或依赖变化新增稳定
+契约键。键是机器可比较的语义标识，纯改名、重排、同义断言或改写同义键不构成新版本。
+`revision_allowed=false` 时 worker 使用 catalog 的 `revision_blocker`（例如
+`max_published_versions_reached`）作为具体排除事实。`existing_family_sufficient` 仅表示
+`revision_head` 已覆盖
+需求；`no_material_tool_delta` 表示没有上述
+实质增量；`draft_not_ready` 仅表示具体的安全性、完整性、可移植性或 peer 可运行性阻塞。
+
+`SharedToolFamily` 保存一个 `pending_head` 和一个 `discoverable_head`。新 revision 等待 Tool View 时，
+Global Evidence 继续暴露旧 discoverable head；Tool View 成功后 runtime 原子切换 head，失败则清空
+pending 并保留旧 head。更新的 pending revision 会取代尚未生成 Tool View 的旧 pending revision，
+旧 iteration 仍生成普通 View，但不再请求过期 Tool View。跨 candidate 更新在 run transaction 内
+仲裁。worker 通过不含路径和源码的 `tool_family_catalog` 发现 family 身份、pending/discoverable
+head、唯一 `revision_head`、累计能力/覆盖键及版本容量；复制仍必须使用 Global Evidence 中
+discoverable head 的精确 `tool_id`/`snapshot_hash`。
+默认配置允许每个 family 一个 pending revision、最多两个不可变发布记录（pending 也计入）；提高
+版本上限后仍可用新 pending 取代尚未完成 Tool View 的旧 pending。该限制按 family 生效，不使用
+run-wide 工具总数限制。
 
 `ToolizationDecision` 只是 `IterationRecord` 的普通事实。缺失、声明 staged 但 staging 为空，
 或声明 not_applicable 但 staging 非空会分别产生 advisory；这些字段只供 monitor/report，
@@ -169,9 +203,13 @@ redispatch 只用于恢复，并继续使用同一个 candidate 工作区、Git 
 冻结 spec 显式启用 `shared_dir` 时，已发布工具还会以 `shared_tools` 出现在同一条
 Global Evidence 中。每项包含 runtime 绑定的 `tool_view`、`tool_id`、`snapshot_hash` 与
 `source_commit`。候选不会看到共享目录路径，也不能在 Tool View 生成前发现工具；它只能通过
-`search_copy_shared_tool` 按精确 id/hash 复制到本地临时 inbox，再在自己的 iteration 中重新验证。
-下一次 worker verifier 原子消费 copy receipt，并将采用作为该 iteration 的事实记录。工具描述与
-采用结果仅是后续搜索的参考，不单独聚合收益，也不改变硬分、retain/discard、选择或 promotion。
+`search_copy_shared_tool` 按精确 id/hash 复制到本地临时 inbox，阅读 manifest 与源码后自行决定
+直接执行或导入、提取并改写局部逻辑、复用诊断方法、作为实现对照，或不采用。复制本身不要求
+调用原工具。只有直接执行、导入或把原快照作为运行时依赖时，才先在当前 workspace 验证原工具；
+只读分析或改写源码不要求运行原工具，最终候选修改仍由正常 process verifier 验证。下一次
+worker verifier 原子消费 copy receipt。当前 schema 中的 `adopted_tools` 仅证明快照曾进入本轮上下文，
+不证明原工具被执行或其代码被保留。工具描述与复制结算事实仅是后续搜索的参考，不单独聚合收益，
+也不改变硬分、retain/discard、选择或 promotion。
 工具化决策本身不进入 Global Evidence。完整状态流保持为：
 `ToolizationDecision -> IterationRecord`，以及独立的
 `staging -> passing verifier -> SharedToolRecord -> Tool View -> Global Evidence -> copy receipt -> adopted_tools`。

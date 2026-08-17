@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import nullcontext
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -36,6 +35,7 @@ from goal_plus.runtime import (
     utc_timestamp_from_epoch,
     write_json,
 )
+from goal_plus.shared_dir import SharedDirManager
 
 
 EVIDENCE_ANNOTATOR_DISABLED_ENV = "GOAL_PLUS_EVIDENCE_ANNOTATOR_DISABLED"
@@ -1386,10 +1386,23 @@ def _bind_tool_views(
     )
     if iteration is None:
         raise AnnotationOutputError("annotation iteration no longer exists")
-    expected = {tool.tool_id: tool for tool in iteration.shared_tools}
+    pending_tool_ids = runtime._pending_tool_view_ids(task.run_id)
+    expected = {
+        tool.tool_id: tool
+        for tool in iteration.shared_tools
+        if tool.tool_id in pending_tool_ids
+    }
     returned = {item.tool_id: item for item in outputs}
-    if set(returned) != set(expected):
+    iteration_tool_ids = {tool.tool_id for tool in iteration.shared_tools}
+    if not set(returned).issubset(iteration_tool_ids):
         raise AnnotationOutputError("Tool View identities do not match published tools")
+    returned = {
+        tool_id: output
+        for tool_id, output in returned.items()
+        if tool_id in expected
+    }
+    if set(returned) != set(expected):
+        raise AnnotationOutputError("Tool View identities do not match current family heads")
     return [
         ToolViewRecord(
             tool_id=tool.tool_id,
@@ -1406,7 +1419,7 @@ def _bind_tool_views(
             limitations=returned[tool.tool_id].limitations,
             evidence_scope="来自通过 process verifier 的 iteration，但不代表工具已被独立验证。",
         )
-        for tool in iteration.shared_tools
+        for tool in expected.values()
     ]
 
 
@@ -1439,11 +1452,7 @@ def _finish_annotation_task(
         except AnnotationOutputError as exc:
             exc.usage = dict(result.usage)
             raise
-    transaction = (
-        runtime._run_transaction(task.run_id)
-        if result is not None
-        else nullcontext()
-    )
+    transaction = runtime._run_transaction(task.run_id)
     with transaction, exclusive_file_lock(
         _task_lock_path(runtime.root_dir, task.run_id)
     ):
@@ -1540,6 +1549,10 @@ def _finish_annotation_task(
                 }
             )
         )
+        # Persist the exact Tool View before exposing its immutable snapshot.
+        # All runtime readers take the run lock, so they see either the old head
+        # or the completed View and its new head together.
+        runtime._reconcile_tool_family_heads(current.run_id)
         return result is not None
 
 

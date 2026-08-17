@@ -131,11 +131,30 @@ def test_run_verifier_exposes_optional_agent_session_id(tmp_path: Path) -> None:
     assert "toolization_decision" in schema["properties"]
     assert "adopted_tools" not in schema["properties"]
     assert schema["properties"]["scope"]["enum"] == ["process", "promotion"]
+    decision_schema = schema["properties"]["toolization_decision"]["anyOf"][0]
+    signal_schema = decision_schema["properties"]["signals"]
+    assert signal_schema["items"]["enum"] == [
+        "repeated_workflow",
+        "domain_construction_or_probe",
+        "behavior_or_invariant_checker",
+        "reproducer_fixture_or_case_generator",
+        "parser_trace_or_comparator",
+        "peer_setup_or_feedback_reduction",
+    ]
+    assert signal_schema["maxItems"] == 6
+    assert signal_schema["description"] == (
+        "Use the six capability-oriented toolization signals."
+    )
     assert tools["search_copy_shared_tool"].parameters["required"] == [
         "agent_session_id",
         "tool_id",
         "snapshot_hash",
     ]
+    copy_description = tools["search_copy_shared_tool"].description
+    assert "供阅读源码或自主复用" in copy_description
+    assert "复制不要求调用原工具" in copy_description
+    assert "只有直接执行、导入或依赖原快照时" in copy_description
+    assert "当前 adopted_tools 只证明快照曾复制进本轮上下文" in copy_description
     assert tools["search_stage_shared_tool"].parameters["required"] == [
         "agent_session_id",
         "name",
@@ -143,6 +162,15 @@ def test_run_verifier_exposes_optional_agent_session_id(tmp_path: Path) -> None:
         "entrypoint",
         "candidate_relative_source_paths",
     ]
+    stage_description = tools["search_stage_shared_tool"].description
+    assert "revision_allowed=true" in stage_description
+    assert "revision_head.tool_id" in stage_description
+    assert "capability_extension 必须" in stage_description
+    assert "adoption_fix 必须有同 family 的真实" in stage_description
+    assert "contract_change 必须" in stage_description
+    assert "不得靠改名或同义键制造增量" in stage_description
+    assert "搜索期间的测试/checker/harness 可以 staging" in stage_description
+    assert "最终交付测试、冻结 verifier/runner/grader" in stage_description
     assert tools["search_get_global_evidence"].parameters["required"] == [
         "agent_session_id"
     ]

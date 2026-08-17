@@ -18,6 +18,7 @@ from goal_plus.models import (
     SearchPlan,
     SearchSpec,
     SearchSpecDraft,
+    SharedDirSpec,
     StrategySpec,
     ToolAdoptionRecord,
     ToolizationDecision,
@@ -114,7 +115,7 @@ def test_toolization_decision_enforces_positive_signals_and_exclusions() -> None
     staged = ToolizationDecision.model_validate(
         {
             "outcome": "staged",
-            "signals": ["repeated_sequence", "parser_or_trace"],
+            "signals": ["repeated_workflow", "parser_trace_or_comparator"],
             "rationale": "  Encodes a repeated trace workflow.  ",
             "tool_names": ["trace-checker"],
         }
@@ -131,6 +132,58 @@ def test_toolization_decision_enforces_positive_signals_and_exclusions() -> None
 
     assert staged.rationale == "Encodes a repeated trace workflow."
     assert not_applicable.exclusion == "single_common_command"
+    current_signals = [
+        "repeated_workflow",
+        "domain_construction_or_probe",
+        "behavior_or_invariant_checker",
+        "reproducer_fixture_or_case_generator",
+        "parser_trace_or_comparator",
+        "peer_setup_or_feedback_reduction",
+    ]
+    for signal in current_signals:
+        decision = ToolizationDecision.model_validate(
+            {
+                "outcome": "staged",
+                "signals": [signal],
+                "rationale": f"Exercises {signal}.",
+                "tool_names": ["diagnostic-helper"],
+            }
+        )
+        assert decision.signals == [signal]
+
+    for removed_signal in [
+        "repeated_sequence",
+        "domain_probe",
+        "parser_or_trace",
+        "peer_setup_reduction",
+    ]:
+        with pytest.raises(ValidationError):
+            ToolizationDecision.model_validate(
+                {
+                    "outcome": "staged",
+                    "signals": [removed_signal],
+                    "rationale": "Removed signal must not enter a new run.",
+                    "tool_names": ["invalid-helper"],
+                }
+            )
+    assert ToolizationDecision.model_validate(
+        {
+            "outcome": "not_applicable",
+            "signals": [],
+            "exclusion": "existing_family_sufficient",
+            "rationale": "The current family head already covers this workflow.",
+            "tool_names": [],
+        }
+    ).exclusion == "existing_family_sufficient"
+    assert ToolizationDecision.model_validate(
+        {
+            "outcome": "not_applicable",
+            "signals": [],
+            "exclusion": "max_published_versions_reached",
+            "rationale": "The family has reached its configured version limit.",
+            "tool_names": [],
+        }
+    ).exclusion == "max_published_versions_reached"
 
     for payload, message in [
         (
@@ -145,7 +198,7 @@ def test_toolization_decision_enforces_positive_signals_and_exclusions() -> None
         (
             {
                 "outcome": "staged",
-                "signals": ["domain_probe"],
+                "signals": ["behavior_or_invariant_checker"],
                 "rationale": "No named staged tool.",
                 "tool_names": [],
             },
@@ -163,6 +216,12 @@ def test_toolization_decision_enforces_positive_signals_and_exclusions() -> None
     ]:
         with pytest.raises(ValidationError, match=message):
             ToolizationDecision.model_validate(payload)
+
+
+def test_shared_dir_family_governance_defaults() -> None:
+    spec = SharedDirSpec(enabled=True)
+    assert spec.max_pending_revisions_per_family == 1
+    assert spec.max_published_versions_per_family == 2
 
 
 def valid_spec_dict() -> dict:

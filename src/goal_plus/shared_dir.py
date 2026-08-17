@@ -21,13 +21,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypedDict
 
-from goal_plus.models import SharedToolRecord
+from goal_plus.models import SharedToolFamily, SharedToolRecord, ToolPublicationIntent
 
 
 SHARE_OUT_RELATIVE_PATH = ".tmp/share-out"
 TOOL_DRAFTS_RELATIVE_PATH = ".tmp/tool-drafts"
 TOOL_INBOX_RELATIVE_PATH = ".tmp/shared-tools"
-SHARED_INDEX_SCHEMA_VERSION = 1
+SHARED_INDEX_SCHEMA_VERSION = 2
 TOOL_VIEW_MAX_CONTENT_BYTES = 256 * 1024
 TOOL_VIEW_MAX_FILE_BYTES = 64 * 1024
 
@@ -54,7 +54,7 @@ def _is_link_or_reparse_point(path: Path) -> bool:
     )
 
 
-def _manifest_metadata(tool: Path) -> tuple[str, str | None, str | None]:
+def _manifest_payload(tool: Path) -> dict[str, Any]:
     manifest_path = tool / "manifest.json" if tool.is_dir() else None
     payload: dict[str, Any] = {}
     if manifest_path is not None and manifest_path.is_file():
@@ -72,11 +72,10 @@ def _manifest_metadata(tool: Path) -> tuple[str, str | None, str | None]:
         normalized = " ".join(value.split()).strip()
         return normalized[:limit] or None
 
-    return (
-        text_field("name", 120) or tool.name,
-        text_field("summary", 500),
-        text_field("entrypoint", 300),
-    )
+    payload["name"] = text_field("name", 120) or tool.name
+    payload["summary"] = text_field("summary", 500)
+    payload["entrypoint"] = text_field("entrypoint", 300)
+    return payload
 
 
 class _StagedToolResult(TypedDict):
@@ -89,6 +88,10 @@ class _StagedToolResult(TypedDict):
     file_count: int
     size_bytes: int
     path_count: int
+    publication_intent: ToolPublicationIntent
+    supersedes_tool_id: str | None
+    capability_ids: list[str]
+    coverage_keys: list[str]
 
 
 class _StagingInspection(TypedDict):
@@ -125,12 +128,20 @@ class _ToolManifest:
     name: str
     summary: str
     entrypoint: str
+    publication_intent: ToolPublicationIntent
+    supersedes_tool_id: str | None
+    capability_ids: tuple[str, ...]
+    coverage_keys: tuple[str, ...]
 
     def to_bytes(self) -> bytes:
         payload = {
             "name": self.name,
             "summary": self.summary,
             "entrypoint": self.entrypoint,
+            "publication_intent": self.publication_intent,
+            "supersedes_tool_id": self.supersedes_tool_id,
+            "capability_ids": list(self.capability_ids),
+            "coverage_keys": list(self.coverage_keys),
         }
         return (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode(
             "utf-8"
@@ -227,6 +238,10 @@ class SharedDirManager:
         summary: str,
         entrypoint: str,
         candidate_relative_source_paths: list[str],
+        publication_intent: ToolPublicationIntent = "new",
+        supersedes_tool_id: str | None = None,
+        capability_ids: list[str] | None = None,
+        coverage_keys: list[str] | None = None,
         max_tools: int,
         max_files: int,
         max_bytes: int,
@@ -244,7 +259,15 @@ class SharedDirManager:
         workspace, draft_root, resolved_draft_root = self._prepare_draft_roots(
             workspace, share_out_dir
         )
-        manifest = self._validate_manifest(name, summary, entrypoint)
+        manifest = self._validate_manifest(
+            name,
+            summary,
+            entrypoint,
+            publication_intent=publication_intent,
+            supersedes_tool_id=supersedes_tool_id,
+            capability_ids=capability_ids or [],
+            coverage_keys=coverage_keys or [],
+        )
         selected = self._select_draft_sources(
             candidate_relative_source_paths,
             draft_root=draft_root,
@@ -301,6 +324,10 @@ class SharedDirManager:
             "file_count": len(files),
             "size_bytes": size_bytes,
             "path_count": path_count,
+            "publication_intent": manifest.publication_intent,
+            "supersedes_tool_id": manifest.supersedes_tool_id,
+            "capability_ids": list(manifest.capability_ids),
+            "coverage_keys": list(manifest.coverage_keys),
         }
 
     @staticmethod
@@ -329,11 +356,50 @@ class SharedDirManager:
         return workspace, draft_root, resolved_draft_root
 
     @staticmethod
-    def _validate_manifest(name: str, summary: str, entrypoint: str) -> _ToolManifest:
+    def _validate_manifest(
+        name: str,
+        summary: str,
+        entrypoint: str,
+        *,
+        publication_intent: ToolPublicationIntent,
+        supersedes_tool_id: str | None,
+        capability_ids: list[str],
+        coverage_keys: list[str],
+    ) -> _ToolManifest:
+        if publication_intent not in {
+            "new",
+            "capability_extension",
+            "adoption_fix",
+            "contract_change",
+        }:
+            raise ValueError("invalid tool publication_intent")
+        def normalize_keys(values: list[str], field_name: str) -> tuple[str, ...]:
+            if len(values) > (32 if field_name == "capability_ids" else 64):
+                raise ValueError(f"{field_name} contains too many entries")
+            normalized = tuple(" ".join(value.strip().split()) for value in values)
+            if any(not value or len(value) > 160 for value in normalized):
+                raise ValueError(f"{field_name} entries must contain 1-160 characters")
+            if len(set(normalized)) != len(normalized):
+                raise ValueError(f"{field_name} entries must be unique")
+            return normalized
+
+        supersedes_tool_id = (
+            " ".join(supersedes_tool_id.strip().split())
+            if isinstance(supersedes_tool_id, str)
+            else None
+        )
+        if publication_intent == "new" and supersedes_tool_id:
+            raise ValueError("new tool publication cannot supersede an existing tool")
+        if publication_intent != "new" and not supersedes_tool_id:
+            raise ValueError("tool revision publication requires supersedes_tool_id")
         manifest = _ToolManifest(
             name=" ".join(name.split()).strip(),
             summary=" ".join(summary.split()).strip(),
             entrypoint=entrypoint.strip(),
+            publication_intent=publication_intent,
+            supersedes_tool_id=supersedes_tool_id,
+            capability_ids=normalize_keys(capability_ids, "capability_ids"),
+            coverage_keys=normalize_keys(coverage_keys, "coverage_keys"),
         )
         if not manifest.name or len(manifest.name) > 120:
             raise ValueError("tool name must contain 1-120 characters")
@@ -641,6 +707,9 @@ class SharedDirManager:
         max_bytes: int,
         max_path_entries: int,
         max_depth: int,
+        max_pending_revisions_per_family: int = 1,
+        max_published_versions_per_family: int = 2,
+        adopted_tool_ids: set[str] | None = None,
     ) -> SharedDirSettlement:
         """Atomically claim staging, publish deltas, and consume accepted input."""
         limits = _ToolLimits(
@@ -672,7 +741,7 @@ class SharedDirManager:
             candidate_id=candidate_id,
             iteration=iteration,
         )
-        existing = self._load_index()
+        existing, families = self._load_index_state()
         batch = _SettlementBatch(
             result=result,
             latest_by_source=self._latest_by_source(existing, candidate_id),
@@ -690,13 +759,21 @@ class SharedDirManager:
                         iteration=iteration,
                         source_commit=source_commit,
                         limits=limits,
+                        existing=existing,
+                        families=families,
+                        max_pending_revisions_per_family=max_pending_revisions_per_family,
+                        max_published_versions_per_family=max_published_versions_per_family,
+                        adopted_tool_ids=adopted_tool_ids or set(),
                     )
                 except (OSError, ValueError) as exc:
                     result.errors.append(f"{entry.name}: {exc}")
                     self._restore_entry(entry, share_out_dir, result.errors)
 
             if batch.new_records:
-                self._append_index(batch.new_records)
+                self._append_index(
+                    batch.new_records,
+                    families=list(families.values()),
+                )
         except Exception:
             # No index publication means none of this batch is durably settled.
             for entry in batch.processed_entries:
@@ -723,6 +800,11 @@ class SharedDirManager:
         iteration: int,
         source_commit: str | None,
         limits: _ToolLimits,
+        existing: list[dict[str, Any]],
+        families: dict[str, SharedToolFamily],
+        max_pending_revisions_per_family: int,
+        max_published_versions_per_family: int,
+        adopted_tool_ids: set[str],
     ) -> None:
         files, size_bytes, path_entries = self._tool_files(
             entry,
@@ -740,10 +822,26 @@ class SharedDirManager:
             expected_size=size_bytes,
         )
         source_relative_path = entry.relative_to(claim_dir).as_posix()
+        manifest = _manifest_payload(entry)
+        manifest.setdefault("publication_intent", "new")
+        manifest.setdefault("supersedes_tool_id", None)
+        manifest.setdefault("capability_ids", [])
+        manifest.setdefault("coverage_keys", [])
         previous = batch.latest_by_source.get(source_relative_path)
         if previous and previous.get("snapshot_hash") == snapshot_hash:
             batch.result.deduplicated_entries.append(entry.name)
         else:
+            staged_families = dict(families)
+            family, version = self._resolve_publication_family(
+                manifest,
+                existing=[*existing, *(item.model_dump(mode="json") for item in batch.new_records)],
+                families=staged_families,
+                snapshot_hash=snapshot_hash,
+                adopted_tool_ids=adopted_tool_ids,
+                max_pending_revisions_per_family=max_pending_revisions_per_family,
+                max_published_versions_per_family=max_published_versions_per_family,
+                prior_source=previous,
+            )
             record, created_snapshot = self._publish_tool(
                 candidate_id=candidate_id,
                 iteration=iteration,
@@ -755,7 +853,21 @@ class SharedDirManager:
                 size_bytes=size_bytes,
                 snapshot_hash=snapshot_hash,
                 physical_by_hash=batch.physical_by_hash,
+                family_id=family.family_id,
+                version=version,
+                publication_intent=manifest["publication_intent"],
+                supersedes_tool_id=manifest.get("supersedes_tool_id"),
+                capability_ids=list(manifest.get("capability_ids") or []),
+                coverage_keys=list(manifest.get("coverage_keys") or []),
             )
+            families[family.family_id] = family.model_copy(
+                update={
+                    "pending_head": record.tool_id,
+                    "updated_at": _utc_timestamp(),
+                }
+            )
+            for family_id, staged_family in staged_families.items():
+                families.setdefault(family_id, staged_family)
             batch.new_records.append(record)
             if created_snapshot:
                 batch.created_snapshots.append(record.read_only_path)
@@ -769,6 +881,115 @@ class SharedDirManager:
         )
         batch.processed_entries.append(entry)
         batch.result.consumed_entries.append(entry.name)
+
+    @staticmethod
+    def _resolve_publication_family(
+        manifest: dict[str, Any],
+        *,
+        existing: list[dict[str, Any]],
+        families: dict[str, SharedToolFamily],
+        snapshot_hash: str,
+        adopted_tool_ids: set[str],
+        max_pending_revisions_per_family: int,
+        max_published_versions_per_family: int,
+        prior_source: dict[str, Any] | None,
+    ) -> tuple[SharedToolFamily, int]:
+        intent = manifest.get("publication_intent", "new")
+        if intent not in {
+            "new",
+            "capability_extension",
+            "adoption_fix",
+            "contract_change",
+        }:
+            raise ValueError("invalid tool publication_intent")
+        supersedes = manifest.get("supersedes_tool_id")
+        if supersedes is not None and (not isinstance(supersedes, str) or not supersedes):
+            raise ValueError("invalid supersedes_tool_id")
+        for field_name, limit in (("capability_ids", 32), ("coverage_keys", 64)):
+            values = manifest.get(field_name, [])
+            if (
+                not isinstance(values, list)
+                or len(values) > limit
+                or any(not isinstance(item, str) or not item or len(item) > 160 for item in values)
+                or len(set(values)) != len(values)
+            ):
+                raise ValueError(f"invalid {field_name}")
+        tools = {
+            item.get("tool_id"): SharedToolRecord.model_validate(item)
+            for item in existing
+            if isinstance(item.get("tool_id"), str)
+        }
+        now = _utc_timestamp()
+        if intent == "new":
+            if supersedes is not None:
+                raise ValueError("new tool publication cannot supersede an existing tool")
+            if prior_source is not None:
+                raise ValueError(
+                    "existing_family_sufficient: an existing staging slot requires "
+                    "an explicit material revision"
+                )
+            identity = hashlib.sha256(
+                f"{snapshot_hash}\0{uuid.uuid4().hex}".encode("utf-8")
+            ).hexdigest()[:24]
+            family = SharedToolFamily(
+                family_id=f"family-{identity}",
+                pending_head=None,
+                discoverable_head=None,
+                created_at=now,
+                updated_at=now,
+            )
+            families[family.family_id] = family
+            return family, 1
+
+        base = tools.get(supersedes)
+        if base is None:
+            raise ValueError("tool revision supersedes an unknown tool_id")
+        family = families.get(base.family_id)
+        if family is None:
+            family = SharedToolFamily(
+                family_id=base.family_id,
+                pending_head=None,
+                discoverable_head=base.tool_id,
+                created_at=base.created_at,
+                updated_at=now,
+            )
+            families[family.family_id] = family
+        if base.tool_id not in {family.pending_head, family.discoverable_head}:
+            raise ValueError("tool revision must supersede a current family head")
+        replacing_pending = family.pending_head == base.tool_id
+        if family.pending_head is not None and not replacing_pending:
+            raise ValueError("tool family already has the maximum pending revisions")
+        if max_pending_revisions_per_family < 1:
+            raise ValueError("tool family does not allow pending revisions")
+        versions = [item for item in tools.values() if item.family_id == family.family_id]
+        if len(versions) >= max_published_versions_per_family:
+            raise ValueError("tool family already has the maximum published versions")
+        if any(item.snapshot_hash == snapshot_hash for item in versions):
+            raise ValueError("no_material_tool_delta: snapshot already exists in family")
+
+        capabilities = set(manifest.get("capability_ids") or [])
+        coverage = set(manifest.get("coverage_keys") or [])
+        known_capabilities = {
+            key for item in versions for key in item.capability_ids
+        }
+        known_coverage = {key for item in versions for key in item.coverage_keys}
+        added_capability = bool(capabilities - known_capabilities)
+        added_coverage = bool(coverage - known_coverage)
+        if intent == "capability_extension" and not (added_capability or added_coverage):
+            raise ValueError("no_material_tool_delta: revision adds no capability or coverage key")
+        if intent == "adoption_fix" and not any(
+            item.tool_id in adopted_tool_ids for item in versions
+        ):
+            raise ValueError(
+                "no_material_tool_delta: adoption fix requires copy/adoption evidence "
+                "from this family"
+            )
+        if intent == "contract_change" and not (added_capability or added_coverage):
+            raise ValueError(
+                "no_material_tool_delta: contract change must add a capability/coverage "
+                "contract key; changing only the entrypoint is not material"
+            )
+        return family, max((item.version for item in versions), default=0) + 1
 
     @staticmethod
     def _cleanup_claim(
@@ -1128,6 +1349,12 @@ class SharedDirManager:
         size_bytes: int,
         snapshot_hash: str,
         physical_by_hash: dict[str, Path],
+        family_id: str,
+        version: int,
+        publication_intent: ToolPublicationIntent,
+        supersedes_tool_id: str | None,
+        capability_ids: list[str],
+        coverage_keys: list[str],
     ) -> tuple[SharedToolRecord, bool]:
         destination = physical_by_hash.get(snapshot_hash)
         created_snapshot = False
@@ -1177,7 +1404,10 @@ class SharedDirManager:
                     shutil.rmtree(temporary, ignore_errors=True)
                 raise
 
-        name, summary, entrypoint = _manifest_metadata(tool)
+        manifest = _manifest_payload(tool)
+        name = str(manifest["name"])
+        summary = manifest.get("summary")
+        entrypoint = manifest.get("entrypoint")
         identity = hashlib.sha256(
             f"{candidate_id}\0{iteration}\0{source_relative_path}\0{snapshot_hash}".encode(
                 "utf-8"
@@ -1185,6 +1415,12 @@ class SharedDirManager:
         ).hexdigest()
         return SharedToolRecord(
             tool_id=f"{candidate_id}-i{iteration:04d}-{identity[:16]}",
+            family_id=family_id,
+            version=version,
+            publication_intent=publication_intent,
+            supersedes_tool_id=supersedes_tool_id,
+            capability_ids=capability_ids,
+            coverage_keys=coverage_keys,
             candidate_id=candidate_id,
             iteration=iteration,
             source_commit=source_commit,
@@ -1337,28 +1573,210 @@ class SharedDirManager:
         except OSError:
             pass
 
-    def _append_index(self, tools: list[SharedToolRecord]) -> None:
+    def _append_index(
+        self,
+        tools: list[SharedToolRecord],
+        *,
+        families: list[SharedToolFamily] | None = None,
+    ) -> None:
         existing = self._load_index()
         by_id = {item.get("tool_id"): item for item in existing}
         for tool in tools:
             payload = tool.model_dump(mode="json")
             by_id[payload["tool_id"]] = payload
-        self._write_index(list(by_id.values()))
+        self._write_index(list(by_id.values()), families=families)
 
-    def _load_index(self) -> list[dict[str, Any]]:
+    def tool_family_catalog(
+        self,
+        *,
+        max_published_versions_per_family: int,
+    ) -> list[dict[str, Any]]:
+        """Return the path-free family catalog from one atomic index snapshot."""
+        if max_published_versions_per_family < 1:
+            raise ValueError("max published versions per family must be positive")
+        existing, families = self._load_index_state()
+        tools = {
+            tool.tool_id: tool
+            for item in existing
+            for tool in [SharedToolRecord.model_validate(item)]
+        }
+        catalog: list[dict[str, Any]] = []
+        for family in sorted(families.values(), key=lambda item: item.family_id):
+            pending = tools.get(family.pending_head or "")
+            discoverable = tools.get(family.discoverable_head or "")
+            revision_head = pending or discoverable
+            if revision_head is None:
+                continue
+            family_tools = [
+                tool for tool in tools.values() if tool.family_id == family.family_id
+            ]
+            published_version_count = len(family_tools)
+            revision_allowed = (
+                published_version_count < max_published_versions_per_family
+            )
+
+            def head_payload(tool: SharedToolRecord | None) -> dict[str, Any] | None:
+                if tool is None:
+                    return None
+                return {
+                    "tool_id": tool.tool_id,
+                    "snapshot_hash": tool.snapshot_hash,
+                    "version": tool.version,
+                }
+
+            catalog.append(
+                {
+                    "family_id": family.family_id,
+                    "pending_head": head_payload(pending),
+                    "discoverable_head": head_payload(discoverable),
+                    "revision_head": head_payload(revision_head),
+                    "published_version_count": published_version_count,
+                    "max_published_versions_per_family": (
+                        max_published_versions_per_family
+                    ),
+                    "revision_allowed": revision_allowed,
+                    "revision_blocker": (
+                        None
+                        if revision_allowed
+                        else "max_published_versions_reached"
+                    ),
+                    "name": revision_head.name,
+                    "capability_ids": sorted(
+                        {
+                            key
+                            for tool in family_tools
+                            for key in tool.capability_ids
+                        }
+                    ),
+                    "coverage_keys": sorted(
+                        {
+                            key
+                            for tool in family_tools
+                            for key in tool.coverage_keys
+                        }
+                    ),
+                    "contract_fingerprint": hashlib.sha256(
+                        (revision_head.entrypoint or "").encode("utf-8")
+                    ).hexdigest(),
+                }
+            )
+        return catalog
+
+    def _load_index_state(
+        self,
+    ) -> tuple[list[dict[str, Any]], dict[str, SharedToolFamily]]:
         if not self.index_path.exists():
-            return []
+            return [], {}
         payload = json.loads(self.index_path.read_text(encoding="utf-8"))
         tools = payload.get("tools") if isinstance(payload, dict) else None
         if not isinstance(tools, list):
             raise ValueError("shared tool index has an invalid shape")
-        return [item for item in tools if isinstance(item, dict)]
+        tool_items = [item for item in tools if isinstance(item, dict)]
+        raw_families = payload.get("families")
+        if raw_families is None:
+            families = {}
+            for item in tool_items:
+                tool = SharedToolRecord.model_validate(item)
+                families[tool.family_id] = SharedToolFamily(
+                    family_id=tool.family_id,
+                    pending_head=None,
+                    discoverable_head=tool.tool_id,
+                    created_at=tool.created_at,
+                    updated_at=tool.created_at,
+                )
+        elif not isinstance(raw_families, list):
+            raise ValueError("shared tool family index has an invalid shape")
+        else:
+            families = {
+                family.family_id: family
+                for item in raw_families
+                if isinstance(item, dict)
+                for family in [SharedToolFamily.model_validate(item)]
+            }
+        return tool_items, families
 
-    def _write_index(self, tools: list[dict[str, Any]]) -> None:
+    def _load_index(self) -> list[dict[str, Any]]:
+        tools, _families = self._load_index_state()
+        return tools
+
+    def load_families(self) -> list[SharedToolFamily]:
+        return list(self._load_families().values())
+
+    def _load_families(self) -> dict[str, SharedToolFamily]:
+        _tools, families = self._load_index_state()
+        return families
+
+    def _write_families(self, families: list[SharedToolFamily]) -> None:
+        self._write_index(self._load_index(), families=families)
+
+    def advance_discoverable_heads(self, tools: list[SharedToolRecord]) -> bool:
+        families = self._load_families()
+        for tool in tools:
+            family = families.get(tool.family_id)
+            if family is None or family.pending_head != tool.tool_id:
+                return False
+        now = _utc_timestamp()
+        for tool in tools:
+            family = families[tool.family_id]
+            families[tool.family_id] = family.model_copy(
+                update={
+                    "pending_head": None,
+                    "discoverable_head": tool.tool_id,
+                    "updated_at": now,
+                }
+            )
+        self._write_families(list(families.values()))
+        return True
+
+    def reject_pending_heads(self, tools: list[SharedToolRecord]) -> bool:
+        families = self._load_families()
+        matched = [
+            tool
+            for tool in tools
+            if (family := families.get(tool.family_id)) is not None
+            and family.pending_head == tool.tool_id
+        ]
+        if not matched:
+            return False
+        now = _utc_timestamp()
+        for tool in matched:
+            family = families[tool.family_id]
+            families[tool.family_id] = family.model_copy(
+                update={"pending_head": None, "updated_at": now}
+            )
+        self._write_families(list(families.values()))
+        return True
+
+    def discoverable_tool_ids(self) -> set[str]:
+        return {
+            family.discoverable_head
+            for family in self.load_families()
+            if family.discoverable_head is not None
+        }
+
+    def pending_tool_ids(self) -> set[str]:
+        return {
+            family.pending_head
+            for family in self.load_families()
+            if family.pending_head is not None
+        }
+
+    def _write_index(
+        self,
+        tools: list[dict[str, Any]],
+        *,
+        families: list[SharedToolFamily] | None = None,
+    ) -> None:
         self.shared_dir.mkdir(parents=True, exist_ok=True)
+        if families is None and self.index_path.exists():
+            families = list(self._load_families().values())
         payload = {
             "schema_version": SHARED_INDEX_SCHEMA_VERSION,
             "tools": tools,
+            "families": [
+                item.model_dump(mode="json")
+                for item in sorted(families or [], key=lambda item: item.family_id)
+            ],
         }
         self.index_temp_dir.mkdir(parents=True, exist_ok=True)
         temporary = self.index_temp_dir / (

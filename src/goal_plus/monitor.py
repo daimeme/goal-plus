@@ -32,6 +32,7 @@ from goal_plus.statistics import (
     aggregate_usage,
     build_run_statistics,
 )
+from goal_plus.shared_dir import SharedDirManager
 
 
 def _path_mtime(path: str | None) -> float | None:
@@ -825,6 +826,39 @@ def goal_plus_monitor_snapshot(
             "budget_used": run.budget_used,
             "evidence_annotations": _evidence_annotation_payload(run_path),
         }
+        if frozen.spec.shared_dir.enabled:
+            families = SharedDirManager(run_path).load_families()
+            tools = {
+                tool.tool_id: tool
+                for candidate in candidates
+                for iteration in candidate.iterations
+                for tool in iteration.shared_tools
+            }
+            run_payload["shared_tool_families"] = {
+                "family_count": len(families),
+                "pending_count": sum(
+                    family.pending_head is not None for family in families
+                ),
+                "discoverable_count": sum(
+                    family.discoverable_head is not None for family in families
+                ),
+                "families": [
+                    {
+                        **family.model_dump(mode="json"),
+                        "pending_version": (
+                            tools[family.pending_head].version
+                            if family.pending_head in tools
+                            else None
+                        ),
+                        "discoverable_version": (
+                            tools[family.discoverable_head].version
+                            if family.discoverable_head in tools
+                            else None
+                        ),
+                    }
+                    for family in families
+                ],
+            }
 
         for candidate in candidates:
             candidate_sessions = sessions_by_candidate.get(candidate.candidate_id, [])

@@ -100,8 +100,8 @@ feature ledger, and scoped pitfalls. It marks predecessor scores non-reusable.
 | `search_continue_agent_session` | main | return native same-worker continuation fields when supported |
 | `search_get_agent_context` | candidate worker | load authoritative ids, workspace, candidate-local iterations/results, and resume data |
 | `search_get_global_evidence` | candidate worker | project settled worker attempts in the current run as score, disposition, exact attempt commit, and a possibly delayed objective View |
-| `search_stage_shared_tool` | candidate worker | copy explicit sources from the caller's `.tmp/tool-drafts/` into bounded `.tmp/share-out` staging; this does not publish them |
-| `search_copy_shared_tool` | candidate worker | copy a Tool View-bound shared-dir snapshot into the caller's local inbox for reversible verification |
+| `search_stage_shared_tool` | candidate worker | stage an initial tool or a material revision of a `tool_family_catalog` head from explicit `.tmp/tool-drafts/` sources; this does not publish it |
+| `search_copy_shared_tool` | candidate worker | copy a Tool View-bound shared-dir snapshot into the caller's local inbox for source inspection or autonomous reuse |
 | `search_get_evidence_detail` | candidate worker | expand one available supplemental evaluation from the caller's current run; independent mode is candidate-local |
 | `search_get_agent_observability` | main/monitor | read normalized model, timing, terminal, usage, context, artifact, and handoff evidence for one session |
 
@@ -125,6 +125,15 @@ decisions produce iteration advisories only. The staging inventory remains
 authoritative, and decisions/advisories do not affect score, disposition,
 selection, or promotion. `view=null` in Global Evidence means annotation has not been
 published yet; workers continue independently and do not wait or poll.
+
+New decisions use the capability-oriented signals `repeated_workflow`,
+`domain_construction_or_probe`, `behavior_or_invariant_checker`,
+`reproducer_fixture_or_case_generator`, `parser_trace_or_comparator`, and
+`peer_setup_or_feedback_reduction`. Search-local tests, validation functions, reproducers, fixtures/case generators,
+comparators, and invariant checks are eligible tools even when they use a test framework or
+`test_` filename. `restricted_artifact` applies instead to tests intended for the final candidate
+deliverable, frozen verifier/runner/grader artifacts, hidden answers or scoring logic, raw logs/data,
+credentials, and build output. A diagnostic tool must not copy or approximate hidden feedback.
 `strategy.config.global_evidence_mode` controls Evidence delivery without
 changing the candidate-visible prompt or tool surface. `manual` is the default:
 candidates explicitly read the shared run view. `auto` also injects that shared
@@ -144,13 +153,31 @@ before a later attempt. These receipts are observational and never affect
 settlement, selection, promotion, or hard PASS/FAIL.
 When `shared_dir.enabled=true`, Global Evidence additionally projects only tools whose Tool View has
 been generated and runtime-bound. A worker may call `search_copy_shared_tool` with that exact
-`tool_id` and `snapshot_hash`; the next process verifier atomically consumes the local copy receipt.
-This records a candidate-local adoption but does not create a separate tool score, recommendation, or
-selection rule.
+`tool_id` and `snapshot_hash` to inspect the exact manifest and source before deciding whether to run,
+import, adapt, use as a diagnostic reference, compare, or decline the snapshot. Copying does not require
+invoking the original tool. Only direct execution, import, or runtime dependency requires validating the
+original tool in the candidate workspace first;
+adapted candidate code is covered by the normal process verifier. The next process verifier atomically
+consumes the local copy receipt. For the current schema, the resulting `adopted_tools` entry proves that
+the snapshot entered the iteration context, not that the original tool ran or remained in the candidate.
+This fact does not create a separate tool score, recommendation, or selection rule.
 `ToolizationDecision` is an iteration-local review fact and never enters Global
 Evidence. The publication path remains staging -> attributed passing process
 verifier -> immutable shared snapshot -> annotator-bound Tool View -> Global
 Evidence -> exact copy receipt -> adopted tool record.
+`search_get_agent_context` includes `tool_family_catalog` when shared-dir is enabled. The catalog
+contains family/head identities, the unique `revision_head`, version capacity, cumulative capability
+and coverage keys, and a contract fingerprint; it does not contain snapshot paths or source content.
+A first publication uses `publication_intent=new`. A revision is allowed only when
+`revision_allowed=true` and supplies `revision_head.tool_id` as `supersedes_tool_id`.
+`capability_extension` adds a stable capability/coverage key; `adoption_fix` requires a concrete defect
+observed after copying/adopting that family; `contract_change` adds a stable contract key for a material
+entrypoint, input, output, or dependency change. Renamed or synonymous keys do not create novelty.
+When `revision_allowed=false`, the worker records the exact `revision_blocker`, such as
+`max_published_versions_reached`, instead of claiming that the current family is sufficient.
+The runtime permits one pending revision and at most two immutable published
+records per family by default; pending records count toward that limit. It keeps only the single
+`discoverable_head` visible in Global Evidence while its successor awaits Tool View settlement.
 Each worker settlement snapshots the exact attempt base/head, worker host, and
 resolved annotator model/provider into an internal task. Codex runs annotations
 through ephemeral `codex exec`; Pi runs them through ephemeral, tool-free

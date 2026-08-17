@@ -215,19 +215,45 @@ annotator 尚未更新，worker 可先依据 commit、score、disposition 和自
 
 当 FrozenSpec 显式启用 `shared_dir` 时，candidate 只能从 Global Evidence 的
 `shared_tools[*].tool_view` 发现工具；Tool View 前不向 candidate 暴露，生成后由 runtime 绑定。
-producer 每次 verifier 前必须回顾命令序列、临时代码片段和 scratch scripts。可在 peer workspace
-运行且不依赖 candidate 私有临时状态的能力，只要命中 `repeated_sequence`、`domain_probe`、
-`parser_or_trace` 或 `peer_setup_reduction`，就默认提炼到 `.tmp/tool-drafts/` 并用
+Tool View 只用于发现和初筛，不规定复用方式，也不是采用建议；candidate 不得仅凭它推断源码行为。
+producer 每次 verifier 前必须回顾命令序列、临时代码片段、测试代码和 scratch scripts。可在 peer
+workspace 运行且不依赖 candidate 私有临时状态的能力，只要命中当前六类信号之一，就默认提炼到
+`.tmp/tool-drafts/` 并用
 `search_stage_shared_tool` stage。这里的复用范围是同一 run，不要求跨项目；短小、任务专属、
-来自临时代码片段或只输出退出码都不是排除理由。只有 `single_common_command`、
-`logic_free_wrapper`、`restricted_artifact`、`candidate_private_state` 或 `duplicate_snapshot`
-这些具体排除项才支持 `not_applicable`。每次归属于 worker 的 process verifier 都提交
+来自临时代码片段或只输出退出码都不是排除理由。六类信号是 `repeated_workflow`（重复多步流程）、
+`domain_construction_or_probe`（领域构造、边界、配置或兼容性探测）、
+`behavior_or_invariant_checker`（功能验证、断言或行为/性能/资源/状态不变量）、
+`reproducer_fixture_or_case_generator`（最小复现、fixture、输入/corpus/case 生成）、
+`parser_trace_or_comparator`（解析/转换、trace/日志归一化、差分/状态比较、mutation 或失败分析）和
+`peer_setup_or_feedback_reduction`（setup/cleanup、环境 harness 或更短的本地反馈循环）。旧 signal
+仅用于读取历史 iteration，新决策不要使用。测试代码按用途而不是文件名分类：搜索期间临时创建的
+测试文件、功能验证函数、最小复现、fixture/case 生成器、差分或不变量检查可以工具化；使用测试框架、
+`test_` 文件名或验证同一目标行为都不是 `restricted_artifact` 理由。`restricted_artifact` 只包括
+candidate 最终交付或主补丁中的正式测试、冻结 verifier/runner/grader、隐藏答案或评分逻辑，以及日志、
+原始数据、凭据和构建输出；诊断工具不得复制、代理或近似重建隐藏反馈。正式测试中的可复用诊断逻辑
+应提取为最小 checker/harness，而不是发布最终测试文件本身。首次发布使用 `publication_intent=new` 并保持
+低门槛。更新已有 family 前读取 `tool_family_catalog`；仅当 `revision_allowed=true` 时引用
+`revision_head.tool_id`。`capability_extension` 必须新增稳定 capability/coverage key；
+`adoption_fix` 必须有同 family 的真实 copy/adoption 事实及具体缺陷；`contract_change` 必须为有价值
+的入口、输入、输出或依赖变化新增稳定的契约键。键是可机器比较的语义标识，不能靠改名或改写同义键
+制造增量。纯改名、重排或同义断言不得发布。只有 `single_common_command`、`logic_free_wrapper`、
+`restricted_artifact`、`candidate_private_state`、`duplicate_snapshot`、
+`existing_family_sufficient`、`no_material_tool_delta`、`draft_not_ready`、`max_published_versions_reached`
+这些具体排除项才支持 `not_applicable`。`revision_allowed=false` 时使用 `revision_blocker` 的准确值；
+`existing_family_sufficient` 仅表示 `revision_head` 已经覆盖需求；`no_material_tool_delta` 表示没有上述
+实质增量；`draft_not_ready` 仅表示具体的安全性、
+完整性、可移植性或 peer 可运行性阻塞，不能用短小、任务专属、inline 来源或未润色作为理由。
+每次归属于 worker 的 process verifier 都提交
 `toolization_decision`；缺失或与实际 staging 不匹配只记录 monitor/report advisory，不改变硬分、
 结算、选择或 promotion，staging inventory 始终是权威事实。
-先独立判断相关性，再调用
-`search_copy_shared_tool(agent_session_id, tool_id, snapshot_hash)` 将精确快照复制到本地临时
-inbox 并重新验证。下一次 worker verifier 原子消费 receipt。Tool View 与采用结果可以帮助形成
-后续假设，但不改变 hard score、`keep`/`retain`/`discard`/`failure` 结算、选择或 promotion。
+若工具可能相关，调用 `search_copy_shared_tool(agent_session_id, tool_id, snapshot_hash)` 将精确快照
+复制到本地临时 inbox。复制本身不要求调用原工具；先阅读 manifest、入口和源码，再由 candidate 自行决定直接执行或
+导入、提取并改写局部逻辑、复用诊断方法、作为实现对照，或不采用；这些示例不限制其他合理方式。
+只有直接执行、导入或把原快照作为运行时依赖时，才在使用前验证其入口、依赖、路径假设和输出
+语义；只读分析或改写源码不要求先运行原工具，最终 candidate 修改仍由正常 process verifier
+验证。下一次 worker verifier 原子消费复制 receipt；当前 `adopted_tools` 只证明该快照曾复制进
+本轮上下文，不证明原工具被执行或其代码被保留。Tool View 与复制结算事实可以帮助形成后续假设，
+但不改变 hard score、`keep`/`retain`/`discard`/`failure` 结算、选择或 promotion。
 host transcript 是有用上下文，但不是权威 Search 状态。
 
 Codex 的同 worker continuation 使用 `search_continue_agent_session`，随后对现有 task

@@ -635,7 +635,7 @@ def test_shared_evidence_view_does_not_substitute_worker_text_for_missing_view()
                             "view_error": None,
                             "toolization_decision": {
                                 "outcome": "staged",
-                                "signals": ["parser_or_trace"],
+                                "signals": ["parser_trace_or_comparator"],
                                 "exclusion": None,
                                 "rationale": "Parses a non-trivial trace <safely>.",
                                 "tool_names": ["score-helper"],
@@ -674,7 +674,7 @@ def test_shared_evidence_view_does_not_substitute_worker_text_for_missing_view()
     assert "Objective View &lt;script&gt;is escaped&lt;/script&gt;." in html
     assert "Published Tool View" in html
     assert "Toolization Review" in html
-    assert "parser_or_trace" in html
+    assert "parser_trace_or_comparator" in html
     assert "toolization_stage_missing" in html
     assert "Parses a non-trivial trace &lt;safely&gt;." in html
     assert "Tool Adoption Summary" in html

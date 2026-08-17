@@ -189,6 +189,8 @@ const SharedDirSpec = Type.Object(
 	{
 		enabled: Type.Boolean(),
 		max_tools_per_iteration: Type.Optional(PositiveInteger),
+		max_pending_revisions_per_family: Type.Optional(Type.Literal(1)),
+		max_published_versions_per_family: Type.Optional(Type.Integer({ minimum: 1, maximum: 32 })),
 		max_files_per_iteration: Type.Optional(PositiveInteger),
 		max_path_entries_per_iteration: Type.Optional(PositiveInteger),
 		max_depth: Type.Optional(PositiveInteger),
@@ -197,10 +199,12 @@ const SharedDirSpec = Type.Object(
 	{ additionalProperties: false },
 );
 const ToolizationSignal = Type.Union([
-	Type.Literal("repeated_sequence"),
-	Type.Literal("domain_probe"),
-	Type.Literal("parser_or_trace"),
-	Type.Literal("peer_setup_reduction"),
+	Type.Literal("repeated_workflow"),
+	Type.Literal("domain_construction_or_probe"),
+	Type.Literal("behavior_or_invariant_checker"),
+	Type.Literal("reproducer_fixture_or_case_generator"),
+	Type.Literal("parser_trace_or_comparator"),
+	Type.Literal("peer_setup_or_feedback_reduction"),
 ]);
 const ToolizationExclusion = Type.Union([
 	Type.Literal("single_common_command"),
@@ -208,11 +212,18 @@ const ToolizationExclusion = Type.Union([
 	Type.Literal("restricted_artifact"),
 	Type.Literal("candidate_private_state"),
 	Type.Literal("duplicate_snapshot"),
+	Type.Literal("existing_family_sufficient"),
+	Type.Literal("no_material_tool_delta"),
+	Type.Literal("draft_not_ready"),
+	Type.Literal("max_published_versions_reached"),
 ]);
 const ToolizationDecision = Type.Object(
 	{
 		outcome: Type.Union([Type.Literal("staged"), Type.Literal("not_applicable")]),
-		signals: Type.Array(ToolizationSignal, { maxItems: 4 }),
+		signals: Type.Array(ToolizationSignal, {
+			maxItems: 6,
+			description: "使用六个 capability-oriented toolization signal。",
+		}),
 		exclusion: Type.Optional(Type.Union([ToolizationExclusion, Type.Null()])),
 		rationale: Type.String({ minLength: 1, maxLength: 1000 }),
 		tool_names: Type.Array(Type.String({ minLength: 1, maxLength: 120 }), { maxItems: 16 }),
@@ -501,6 +512,23 @@ const RuntimeToolSchemas: Record<string, TSchema> = {
 			candidate_relative_source_paths: Type.Array(Type.String({ minLength: 1 }), {
 				minItems: 1,
 			}),
+			publication_intent: Type.Optional(
+				Type.Union([
+					Type.Literal("new"),
+					Type.Literal("capability_extension"),
+					Type.Literal("adoption_fix"),
+					Type.Literal("contract_change"),
+				]),
+			),
+			supersedes_tool_id: Type.Optional(Type.String({ minLength: 1 })),
+			capability_ids: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 160 }), {
+				maxItems: 32,
+				uniqueItems: true,
+			})),
+			coverage_keys: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 160 }), {
+				maxItems: 64,
+				uniqueItems: true,
+			})),
 		},
 		{ additionalProperties: false },
 	),
@@ -592,17 +620,17 @@ const RuntimeToolDescriptions: Record<string, string> = {
 	search_create:
 		"从 frozen_spec_id 创建 Search run。初始 run 必须省略 source_run_id，或在 strict schema 下传 null；仅在已有真实前驱时传入准确的 run_* ID，绝不能传 initial 或 in_progress。",
 	search_get_agent_context:
-		"读取当前 worker 的权威 candidate 上下文。candidate_task.share_out_dir 非空表示已启用 shared_dir：同一 run 内可供 peer 使用的 repeated_sequence、domain_probe、parser_or_trace 或 peer_setup_reduction 默认应工具化；短小、任务专属、来自临时代码片段或只输出退出码都不是排除理由。只有 single_common_command、logic_free_wrapper、restricted_artifact、candidate_private_state 或 duplicate_snapshot 支持 not_applicable。",
+		"读取当前 worker 的权威 candidate 上下文。candidate_task.share_out_dir 非空表示已启用 shared_dir，并返回不含路径和源码的 tool_family_catalog；catalog 用 revision_head 指定唯一更新基线，并用 revision_allowed、published_version_count 和 max_published_versions_per_family 暴露容量。toolization_decision 使用 repeated_workflow、domain_construction_or_probe、behavior_or_invariant_checker、reproducer_fixture_or_case_generator、parser_trace_or_comparator、peer_setup_or_feedback_reduction。搜索期测试文件、功能验证函数、复现、fixture/case、差分和不变量检查可以工具化，测试框架、test_ 文件名或验证同一目标行为都不是 restricted_artifact 理由；最终交付测试、冻结 verifier/runner/grader、隐藏答案/评分逻辑、日志、原始数据、凭据和构建输出仍受限。短小、任务专属、来自 inline code 或只输出退出码都不是排除理由。首次工具发布保持低门槛。family 更新仅在 revision_allowed=true 时引用 revision_head.tool_id：capability_extension 必须新增稳定 capability/coverage key；adoption_fix 必须有同 family 的真实 copy/adoption 事实和具体缺陷；contract_change 必须为有价值的入口、输入、输出或依赖变化新增稳定契约键。不得靠改名或同义键制造增量。revision_allowed=false 时使用 revision_blocker 的准确值；existing_family_sufficient 仅表示 revision_head 已覆盖需求；no_material_tool_delta 表示没有上述实质增量；draft_not_ready 只用于具体的安全性、完整性、可移植性或 peer 可运行性阻塞。",
 	search_get_global_evidence:
 		"读取当前 run 的窄 Global Evidence 视图。每项包含 verifier attempt commit、硬 score、keep/retain/discard/failure disposition、可能延迟的客观 View、可选 supplemental evaluation 的可用标记，以及启用 shared_dir 后已由 annotator 描述并由 runtime 绑定的 shared_tools/tool_view。任一 View 为 null 时都无需等待，可先依据 Evidence 独立探索。",
 	search_copy_shared_tool:
-		"将已出现在 Global Evidence 的 Tool View 所对应的精确 shared-dir 快照复制到当前 candidate 的本地临时 inbox。下一次 worker verifier 会原子消费 receipt 并记录采用；复制本身不改变选择、排名或硬分。",
+		"将已出现在 Global Evidence 的 Tool View 所对应的精确 shared-dir 快照复制到当前 candidate 的本地临时 inbox，供阅读源码或自主复用；复制不要求调用原工具。只有直接执行、导入或依赖原快照时，才先在当前 workspace 验证入口、依赖、路径假设和输出语义。下一次 worker verifier 会原子消费 receipt；当前 adopted_tools 只证明快照曾复制进本轮上下文，不证明原工具被执行或其代码被保留，也不改变选择、排名或硬分。",
 	search_stage_shared_tool:
-		"把当前 candidate 的 .tmp/tool-drafts/ 中显式选择的文件安全复制到 .tmp/share-out 的最小工具目录。该工具只负责 staging；路径、链接和 frozen shared-dir 限额由 runtime 校验，发布仍要求归属于当前 worker 且通过的 process verifier。",
+		"把当前 candidate 的 .tmp/tool-drafts/ 中显式选择的文件安全复制到 .tmp/share-out。搜索期测试/checker/harness 可发布；最终交付测试、冻结 verifier/runner/grader、隐藏答案或评分逻辑不可发布。首次发布使用 publication_intent=new。family 更新仅在 tool_family_catalog 的 revision_allowed=true 时引用 revision_head.tool_id：capability_extension 必须新增稳定 capability_ids/coverage_keys；adoption_fix 必须有同 family 的真实 copy/adoption 事实和具体缺陷，不要求制造新键；contract_change 必须为有价值的入口、输入、输出或依赖变化新增稳定契约键。键是机器可比较的语义标识，不能靠改名或同义键制造增量。该工具只负责 staging；路径、链接和 frozen shared-dir 限额由 runtime 校验，发布仍要求归属于当前 worker 且通过的 process verifier。",
 	search_get_evidence_detail:
 		"按需展开一条已结算 Evidence 的 supplemental evaluation。仅当 agent context 声明该能力开启且目标行 supplemental_available=true 时调用；independent 模式只允许读取自己的 candidate。",
 	search_run_verifier:
-		"为一个候选评分。worker process verifier 必须提供一句话 hypothesis，并在 shared_dir 启用时提交 toolization_decision：staged 至少包含一个正向 signal 和实际 tool_names；not_applicable 必须给出具体 exclusion，不能只写不复用。runtime 以 staging inventory 和 publication settlement 为权威，只把 toolization_review_missing、toolization_stage_missing 或 toolization_decision_mismatch 记录为 monitor/report advisory；它们不改变结算、硬 score、选择或 promotion。工具化目标仅是降低同一 run 内 peer 重建诊断流程的成本，不要求跨项目通用。每份报告都会在运行时拥有、继承而来的 workspace/results.tsv 中追加且只追加一条已验证记录，并提交该文件。process verifier 返回 keep/retain/discard/failure disposition；严格改善为 keep，同分为 retain 并成为 candidate-local 最新基线，只有退化或验证失败时恢复此前硬分最佳。开放式补充评价和动态 peer 比较不改变结算、硬 score 或最终 PASS/FAIL。带 candidate_action=stop_and_report 的 VerifierWorkspaceSideEffect 属于基础设施失败：worker 必须停止，不能清理或重试，使父级能够修复并重新冻结。",
+		"为一个候选评分。worker process verifier 必须提供一句话 hypothesis，并在 shared_dir 启用时提交 toolization_decision：staged 至少包含一个当前 capability-oriented signal 和实际 tool_names；not_applicable 必须给出具体 exclusion，不能只写不复用。搜索期行为 checker、功能验证函数、fixture/case、复现、差分和不变量检查是正向候选，不因 test_ 命名而排除。runtime 以 staging inventory 和 publication settlement 为权威，只把 toolization_review_missing、toolization_stage_missing 或 toolization_decision_mismatch 记录为 monitor/report advisory；它们不改变结算、硬 score、选择或 promotion。工具化目标仅是降低同一 run 内 peer 重建诊断流程的成本，不要求跨项目通用。每份报告都会在运行时拥有、继承而来的 workspace/results.tsv 中追加且只追加一条已验证记录，并提交该文件。process verifier 返回 keep/retain/discard/failure disposition；严格改善为 keep，同分为 retain 并成为 candidate-local 最新基线，只有退化或验证失败时恢复此前硬分最佳。开放式补充评价和动态 peer 比较不改变结算、硬 score 或最终 PASS/FAIL。带 candidate_action=stop_and_report 的 VerifierWorkspaceSideEffect 属于基础设施失败：worker 必须停止，不能清理或重试，使父级能够修复并重新冻结。",
 	search_invalidate_run:
 		"主 agent 确认 verifier 契约、覆盖范围、确定性、目标对齐或基础设施失败后，原子地隔离该 run。随后中断每个 host worker，等待 active worker 数归零，修复并重新冻结，再使用 source_run_id 创建后继项。",
 	search_report:

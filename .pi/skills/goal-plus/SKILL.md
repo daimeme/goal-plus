@@ -358,6 +358,16 @@ process verifier 同时返回 candidate-local `disposition`：严格改善为 `k
 process verifier 中提交 `toolization_decision`。决策与 advisory 只进入 iteration、monitor 和
 report；实际 staging inventory 与 passing verifier settlement 始终是发布权威，决策本身不进入
 Global Evidence，也不改变 hard score、结算、选择或 promotion。
+首次工具发布保持低门槛。`search_get_agent_context` 的 `tool_family_catalog` 只暴露 family/head
+身份、版本容量和累计能力/覆盖键，不含路径或源码；更新已有 family 仅在 `revision_allowed=true`
+时引用 `revision_head.tool_id`。`capability_extension` 必须新增稳定 capability/coverage key；
+`adoption_fix` 必须有同 family 的真实 copy/adoption 事实及具体缺陷；`contract_change` 必须为有价值
+的入口、输入、输出或依赖变化新增稳定契约键。不得靠改名或同义键制造增量；`revision_allowed=false`
+时使用 `revision_blocker` 的准确值 `max_published_versions_reached`；`existing_family_sufficient` 仅表示
+`revision_head` 已覆盖需求，`no_material_tool_delta` 表示没有新增稳定键、adoption 证据支持的缺陷修复
+或结构化契约增量，`draft_not_ready` 只用于
+具体的安全性、完整性、可移植性或 peer 可运行性阻塞。同一 family 默认只有一个 pending revision
+和一个 discoverable head；新 Tool View 成功前继续暴露旧 head。
 
 对优化任务，要求 worker 在长时间本地优化循环前创建完整候选产物，并尽早运行
 `search_run_verifier`。对 fix/target 任务，要求先编辑允许文件再调用 verifier；

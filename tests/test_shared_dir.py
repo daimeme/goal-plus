@@ -56,6 +56,7 @@ def _shared_run(
     max_files: int = 64,
     max_bytes: int = 2 * 1024 * 1024,
     max_tools: int = 16,
+    max_published_versions: int = 2,
     max_path_entries: int = 512,
     max_depth: int = 8,
     extra_allowed_files: int = 0,
@@ -81,6 +82,7 @@ def _shared_run(
     data["shared_dir"] = {
         "enabled": enabled,
         "max_tools_per_iteration": max_tools,
+        "max_published_versions_per_family": max_published_versions,
         "max_files_per_iteration": max_files,
         "max_path_entries_per_iteration": max_path_entries,
         "max_depth": max_depth,
@@ -200,15 +202,50 @@ def test_process_verifier_publishes_share_out_into_global_evidence(
     instructions = " ".join(producer_context["candidate_task"]["instructions"])
     assert "shared_dir 发布方规则" in instructions
     assert "同一 run 内其他 candidate" in instructions
-    assert "repeated_sequence" in instructions
-    assert "domain_probe" in instructions
-    assert "parser_or_trace" in instructions
-    assert "peer_setup_reduction" in instructions
+    assert "repeated_workflow" in instructions
+    assert "domain_construction_or_probe" in instructions
+    assert "behavior_or_invariant_checker" in instructions
+    assert "reproducer_fixture_or_case_generator" in instructions
+    assert "parser_trace_or_comparator" in instructions
+    assert "peer_setup_or_feedback_reduction" in instructions
+    assert "测试代码按用途而不是文件名分类" in instructions
+    assert "临时创建的测试文件、功能验证函数" in instructions
+    assert "文件名以 test_ 开头或验证同一目标行为" in instructions
+    assert "candidate 最终交付或主补丁中的正式测试" in instructions
+    assert "冻结 verifier/runner/grader、隐藏答案或评分逻辑" in instructions
+    assert "不得复制、代理或近似重建隐藏反馈" in instructions
     assert ".tmp/tool-drafts" in instructions
     assert "search_stage_shared_tool" in instructions
+    assert "revision_allowed=true" in instructions
+    assert "revision_head.tool_id" in instructions
+    assert "revision_allowed=false 时使用 revision_blocker 的准确值" in instructions
+    assert "max_published_versions_reached" in instructions
+    assert "capability_extension 必须新增至少一个稳定" in instructions
+    assert "adoption_fix 必须有同 family 的真实 copy/adoption 事实" in instructions
+    assert "contract_change 必须" in instructions
+    assert "新增至少一个稳定的 capability/coverage 契约键" in instructions
+    assert "键是可机器比较的语义标识" in instructions
+    assert "draft_not_ready 仅表示存在具体的安全性" in instructions
     assert "toolization_decision" in instructions
     assert "不改变 score、disposition、selection 或 promotion" in instructions
     assert "Tool View 后才会出现在 Global Evidence" in instructions
+    assert "shared_dir 采用方规则" in instructions
+    assert "Tool View 只用于发现和初筛" in instructions
+    assert "不规定复用方式，也不是采用建议" in instructions
+    assert "不要仅凭 Tool View 推断源码行为" in instructions
+    assert "复制本身不要求调用原工具" in instructions
+    assert "先阅读 manifest、入口和源码" in instructions
+    assert "提取并改写局部逻辑" in instructions
+    assert "复用诊断方法" in instructions
+    assert "作为实现对照" in instructions
+    assert "或不采用" in instructions
+    assert "这些示例不限制其他合理方式" in instructions
+    assert "只有直接执行、导入或把原快照作为运行时依赖时" in instructions
+    assert "只读分析或改写源码不要求先运行原工具" in instructions
+    assert "最终 candidate 修改仍由正常 process verifier 验证" in instructions
+    assert "当前 adopted_tools 只证明该快照曾复制进本轮上下文" in instructions
+    assert "不证明原工具被执行或其代码被保留" in instructions
+    assert "复制并在本候选中重新验证" not in instructions
     assert str(shared_dir) not in instructions
     assert "shared/index.json" not in instructions
 
@@ -235,7 +272,7 @@ def test_process_verifier_publishes_share_out_into_global_evidence(
         "Raise the score and export a reusable parser",
         toolization_decision={
             "outcome": "staged",
-            "signals": ["domain_probe"],
+            "signals": ["parser_trace_or_comparator"],
             "exclusion": None,
             "rationale": "Encodes a non-trivial parser used during diagnosis.",
             "tool_names": ["score-helper"],
@@ -246,7 +283,7 @@ def test_process_verifier_publishes_share_out_into_global_evidence(
     assert report.shared_tool_staged_file_count == 2
     assert report.shared_tool_publish_status == "published"
     assert report.toolization_decision is not None
-    assert report.toolization_decision.signals == ["domain_probe"]
+    assert report.toolization_decision.signals == ["parser_trace_or_comparator"]
     assert report.toolization_advisories == []
     assert report.shared_tool_consumed_entries == ["score-helper"]
     assert report.shared_tool_deduplicated_entries == []
@@ -273,8 +310,17 @@ def test_process_verifier_publishes_share_out_into_global_evidence(
     assert (snapshot / "score-helper" / "helper.py").is_file()
 
     index = _shared_index(runtime, run_id)
-    assert index["schema_version"] == 1
+    assert index["schema_version"] == 2
     assert [item["tool_id"] for item in index["tools"]] == [tool["tool_id"]]
+    assert index["families"] == [
+        {
+            "family_id": tool["family_id"],
+            "pending_head": None,
+            "discoverable_head": tool["tool_id"],
+            "created_at": index["families"][0]["created_at"],
+            "updated_at": index["families"][0]["updated_at"],
+        }
+    ]
     iteration = _iterations(runtime, run_id, producer)[0]
     assert iteration["shared_tools"][0]["snapshot_hash"] == tool["snapshot_hash"]
     assert iteration["shared_tool_errors"] == []
@@ -295,8 +341,15 @@ def test_process_verifier_publishes_share_out_into_global_evidence(
         "published": 1
     }
     assert candidate_monitor["toolization_outcome_counts"] == {"staged": 1}
-    assert candidate_monitor["toolization_signal_counts"] == {"domain_probe": 1}
+    assert candidate_monitor["toolization_signal_counts"] == {
+        "parser_trace_or_comparator": 1
+    }
     assert candidate_monitor["toolization_advisory_counts"] == {}
+    family_monitor = monitor["run"]["shared_tool_families"]
+    assert family_monitor["family_count"] == 1
+    assert family_monitor["pending_count"] == 0
+    assert family_monitor["discoverable_count"] == 1
+    assert family_monitor["families"][0]["discoverable_version"] == 1
 
 
 def test_annotator_publishes_bound_tool_view_into_global_evidence(
@@ -862,7 +915,7 @@ def test_toolization_advisories_are_observational_only(tmp_path: Path) -> None:
         "Record a positive toolization signal without staging",
         toolization_decision={
             "outcome": "staged",
-            "signals": ["repeated_sequence"],
+            "signals": ["repeated_workflow"],
             "rationale": "A multi-step workflow was repeated.",
             "tool_names": ["workflow-helper"],
         },
@@ -1052,6 +1105,18 @@ def test_passing_settlement_consumes_staging_and_only_publishes_deltas(
         "def read_score(text):\n    return float(text.rsplit('=', 1)[1])\n",
         encoding="utf-8",
     )
+    [first_tool] = _iterations(runtime, run_id, producer)[0]["shared_tools"]
+    manifest = share_out / "score-helper" / "manifest.json"
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload.update(
+        {
+            "publication_intent": "capability_extension",
+            "supersedes_tool_id": first_tool["tool_id"],
+            "capability_ids": ["parse-final-assignment"],
+            "coverage_keys": ["repeated-assignment"],
+        }
+    )
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
     changed = _run_worker_verifier(
         runtime,
         run_id,
@@ -1062,7 +1127,7 @@ def test_passing_settlement_consumes_staging_and_only_publishes_deltas(
 
     assert _publish_pending_views(runtime, run_id) == 3
     evidence = runtime.get_global_evidence(peer.agent_session_id)
-    assert [len(item["shared_tools"]) for item in evidence] == [1, 0, 1]
+    assert [len(item["shared_tools"]) for item in evidence] == [0, 0, 1]
     index = _shared_index(runtime, run_id)
     assert len(index["tools"]) == 2
     assert len({item["snapshot_hash"] for item in index["tools"]}) == 2
@@ -1097,6 +1162,268 @@ def test_identical_content_from_peers_reuses_one_physical_snapshot(
         item["shared_tools"][0]["read_only_path"] for item in iterations
     }
     assert len(paths) == 1
+
+
+def test_family_revision_waits_for_tool_view_then_atomically_replaces_head(
+    tmp_path: Path,
+) -> None:
+    runtime, run_id, [producer, peer] = _shared_run(tmp_path)
+    _write_tool(producer.share_out)
+    _run_worker_verifier(runtime, run_id, producer, "Publish family v1")
+    assert _publish_pending_views(runtime, run_id) == 1
+    [v1] = runtime.get_global_evidence(peer.agent_session_id)[0]["shared_tools"]
+
+    draft = producer.tool_drafts / "score-helper" / "helper.py"
+    draft.parent.mkdir(parents=True, exist_ok=True)
+    draft.write_text(
+        "def read_score(text):\n    return float(text.rsplit('=', 1)[1])\n",
+        encoding="utf-8",
+    )
+    runtime.stage_shared_tool(
+        producer.agent_session_id,
+        "score-helper-v2",
+        "Parse the final score assignment.",
+        "score-helper/helper.py:read_score",
+        [".tmp/tool-drafts/score-helper/helper.py"],
+        publication_intent="capability_extension",
+        supersedes_tool_id=v1["tool_id"],
+        capability_ids=["parse-final-assignment"],
+        coverage_keys=["repeated-assignment"],
+    )
+    _run_worker_verifier(runtime, run_id, producer, "Publish family v2")
+    visible_while_pending = runtime.get_global_evidence(peer.agent_session_id)
+    assert [
+        tool["tool_id"]
+        for item in visible_while_pending
+        for tool in item["shared_tools"]
+    ] == [v1["tool_id"]]
+    catalog = runtime.get_agent_context(peer.agent_session_id)["tool_family_catalog"]
+    assert catalog[0]["discoverable_head"]["tool_id"] == v1["tool_id"]
+    assert catalog[0]["pending_head"]["version"] == 2
+    assert catalog[0]["revision_head"] == catalog[0]["pending_head"]
+    assert catalog[0]["published_version_count"] == 2
+    assert catalog[0]["max_published_versions_per_family"] == 2
+    assert catalog[0]["revision_allowed"] is False
+    assert catalog[0]["revision_blocker"] == "max_published_versions_reached"
+    assert catalog[0]["capability_ids"] == ["parse-final-assignment"]
+    assert catalog[0]["coverage_keys"] == ["repeated-assignment"]
+    assert "entrypoint" not in catalog[0]
+    assert "summary" not in catalog[0]
+
+    assert _publish_pending_views(runtime, run_id) == 1
+    visible = [
+        tool
+        for item in runtime.get_global_evidence(peer.agent_session_id)
+        for tool in item["shared_tools"]
+    ]
+    assert len(visible) == 1
+    assert visible[0]["family_id"] == v1["family_id"]
+    assert visible[0]["version"] == 2
+    assert visible[0]["supersedes_tool_id"] == v1["tool_id"]
+    with pytest.raises(ValueError, match="not the current discoverable family head"):
+        runtime.copy_shared_tool(
+            peer.agent_session_id,
+            v1["tool_id"],
+            v1["snapshot_hash"],
+        )
+
+    draft.write_text("VALUE = 3\n", encoding="utf-8")
+    runtime.stage_shared_tool(
+        producer.agent_session_id,
+        "score-helper-v3",
+        "Attempt a third family revision.",
+        "score-helper/helper.py:read_score",
+        [".tmp/tool-drafts/score-helper/helper.py"],
+        publication_intent="capability_extension",
+        supersedes_tool_id=visible[0]["tool_id"],
+        capability_ids=["parse-third-form"],
+        coverage_keys=["third-form"],
+    )
+    capped = _run_worker_verifier(runtime, run_id, producer, "Attempt family v3")
+    assert capped.shared_tool_publish_status == "snapshot_rejected"
+    assert "maximum published versions" in capped.shared_tool_errors[0]
+    still_visible = [
+        tool
+        for item in runtime.get_global_evidence(peer.agent_session_id)
+        for tool in item["shared_tools"]
+    ]
+    assert [tool["tool_id"] for tool in still_visible] == [visible[0]["tool_id"]]
+
+
+def test_family_catalog_is_built_from_shared_index(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    runtime, run_id, [producer, _peer] = _shared_run(tmp_path)
+    _write_tool(producer.share_out)
+    _run_worker_verifier(runtime, run_id, producer, "Publish family v1")
+    assert _publish_pending_views(runtime, run_id) == 1
+    manager = SharedDirManager(runtime._run_dir(run_id))
+    expected = manager.tool_family_catalog(
+        max_published_versions_per_family=2,
+    )
+
+    def fail_history_scan(_run_id: str):
+        raise AssertionError("family catalog must not scan candidate iteration history")
+
+    monkeypatch.setattr(runtime, "_load_candidate_records", fail_history_scan)
+
+    assert runtime._tool_family_catalog(run_id) == expected
+
+
+def test_family_governance_rejects_implicit_and_non_material_revisions(
+    tmp_path: Path,
+) -> None:
+    runtime, run_id, [producer, peer] = _shared_run(tmp_path)
+    _write_tool(producer.share_out)
+    _run_worker_verifier(runtime, run_id, producer, "Publish family v1")
+    assert _publish_pending_views(runtime, run_id) == 1
+    [v1] = runtime.get_global_evidence(peer.agent_session_id)[0]["shared_tools"]
+
+    _write_tool(producer.share_out)
+    (producer.share_out / "score-helper" / "helper.py").write_text(
+        "def read_score(text):\n    return float(text.strip().split('=', 1)[1])\n",
+        encoding="utf-8",
+    )
+    implicit = _run_worker_verifier(runtime, run_id, producer, "Restage an implicit update")
+    assert implicit.shared_tool_publish_status == "snapshot_rejected"
+    assert "existing_family_sufficient" in implicit.shared_tool_errors[0]
+
+    draft = producer.tool_drafts / "helper.py"
+    draft.parent.mkdir(parents=True, exist_ok=True)
+    draft.write_text("VALUE = 2\n", encoding="utf-8")
+    runtime.stage_shared_tool(
+        producer.agent_session_id,
+        "helper-non-material",
+        "Rename the helper only.",
+        "helper.py",
+        [".tmp/tool-drafts/helper.py"],
+        publication_intent="capability_extension",
+        supersedes_tool_id=v1["tool_id"],
+    )
+    non_material = _run_worker_verifier(
+        runtime, run_id, producer, "Attempt a non-material revision"
+    )
+    assert non_material.shared_tool_publish_status == "snapshot_rejected"
+    assert "no_material_tool_delta" in non_material.shared_tool_errors[0]
+
+    runtime.stage_shared_tool(
+        producer.agent_session_id,
+        "helper-renamed-entrypoint",
+        "Rename the entrypoint only.",
+        "helper.py:renamed",
+        [".tmp/tool-drafts/helper.py"],
+        publication_intent="contract_change",
+        supersedes_tool_id=v1["tool_id"],
+    )
+    renamed = _run_worker_verifier(
+        runtime, run_id, producer, "Attempt an entrypoint-only rename"
+    )
+    assert renamed.shared_tool_publish_status == "snapshot_rejected"
+    assert any(
+        "changing only the entrypoint is not material" in error
+        for error in renamed.shared_tool_errors
+    )
+
+
+def test_newer_pending_revision_cancels_obsolete_tool_view_and_arbitrates_lanes(
+    tmp_path: Path,
+) -> None:
+    runtime, run_id, [first, second] = _shared_run(
+        tmp_path,
+        max_published_versions=3,
+    )
+    _write_tool(first.share_out)
+    _run_worker_verifier(runtime, run_id, first, "Publish family v1")
+    assert _publish_pending_views(runtime, run_id) == 1
+    [v1] = runtime.get_global_evidence(second.agent_session_id)[0]["shared_tools"]
+
+    def stage_revision(candidate: CandidateSession, base: str, key: str) -> None:
+        draft = candidate.tool_drafts / "helper.py"
+        draft.parent.mkdir(parents=True, exist_ok=True)
+        draft.write_text(f"VALUE = {key!r}\n", encoding="utf-8")
+        runtime.stage_shared_tool(
+            candidate.agent_session_id,
+            f"helper-{key}",
+            f"Revision {key}.",
+            "helper.py",
+            [".tmp/tool-drafts/helper.py"],
+            publication_intent="capability_extension",
+            supersedes_tool_id=base,
+            capability_ids=[key],
+            coverage_keys=[key],
+        )
+
+    stage_revision(first, v1["tool_id"], "v2")
+    _run_worker_verifier(runtime, run_id, first, "Publish pending v2")
+    [v2] = _iterations(runtime, run_id, first)[-1]["shared_tools"]
+    catalog = runtime.get_agent_context(second.agent_session_id)["tool_family_catalog"]
+    assert catalog[0]["revision_head"]["tool_id"] == v2["tool_id"]
+    assert catalog[0]["published_version_count"] == 2
+    assert catalog[0]["max_published_versions_per_family"] == 3
+    assert catalog[0]["revision_allowed"] is True
+    assert catalog[0]["revision_blocker"] is None
+    stage_revision(first, v2["tool_id"], "v3")
+    _run_worker_verifier(runtime, run_id, first, "Replace pending v2 with v3")
+    [v3] = _iterations(runtime, run_id, first)[-1]["shared_tools"]
+    catalog = runtime.get_agent_context(second.agent_session_id)["tool_family_catalog"]
+    assert catalog[0]["revision_head"]["tool_id"] == v3["tool_id"]
+    assert catalog[0]["published_version_count"] == 3
+    assert catalog[0]["revision_allowed"] is False
+    assert catalog[0]["capability_ids"] == ["v2", "v3"]
+    assert catalog[0]["coverage_keys"] == ["v2", "v3"]
+    v2_context = runtime._evidence_annotation_context(run_id, first.candidate_id, 2)
+    assert v2_context["published_tools"] == []
+
+    stage_revision(second, v2["tool_id"], "peer-v3")
+    rejected = _run_worker_verifier(runtime, run_id, second, "Race the current pending head")
+    assert rejected.shared_tool_publish_status == "snapshot_rejected"
+    assert "current family head" in rejected.shared_tool_errors[0]
+
+
+def test_terminal_tool_view_failure_keeps_previous_discoverable_head(
+    tmp_path: Path,
+) -> None:
+    from goal_plus.evidence_annotator import PermanentAnnotationError
+
+    runtime, run_id, [producer, peer] = _shared_run(tmp_path)
+    _write_tool(producer.share_out)
+    _run_worker_verifier(runtime, run_id, producer, "Publish family v1")
+    assert _publish_pending_views(runtime, run_id) == 1
+    [v1] = runtime.get_global_evidence(peer.agent_session_id)[0]["shared_tools"]
+
+    draft = producer.tool_drafts / "helper.py"
+    draft.parent.mkdir(parents=True, exist_ok=True)
+    draft.write_text("VALUE = 2\n", encoding="utf-8")
+    runtime.stage_shared_tool(
+        producer.agent_session_id,
+        "helper-v2",
+        "Add a covered capability.",
+        "helper.py",
+        [".tmp/tool-drafts/helper.py"],
+        publication_intent="capability_extension",
+        supersedes_tool_id=v1["tool_id"],
+        capability_ids=["covered-v2"],
+        coverage_keys=["case-v2"],
+    )
+    _run_worker_verifier(runtime, run_id, producer, "Publish pending v2")
+
+    class FailingAnnotator:
+        def annotate(self, context):
+            if context["published_tools"]:
+                raise PermanentAnnotationError("schema validation failed")
+            return "普通 View"
+
+    drain_evidence_annotations(runtime.root_dir, run_id, annotator=FailingAnnotator())
+    visible = [
+        tool
+        for item in runtime.get_global_evidence(peer.agent_session_id)
+        for tool in item["shared_tools"]
+    ]
+    assert [tool["tool_id"] for tool in visible] == [v1["tool_id"]]
+    catalog = runtime.get_agent_context(peer.agent_session_id)["tool_family_catalog"]
+    assert catalog[0]["pending_head"] is None
+    assert catalog[0]["discoverable_head"]["tool_id"] == v1["tool_id"]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="directory junctions are Windows-only")
@@ -1293,6 +1620,13 @@ def test_shared_dir_is_disabled_by_default(tmp_path: Path) -> None:
     assert "toolization_decision" not in instructions
     assert "Tool View 后才会出现在 Global Evidence" not in instructions
 
+    shared_dir = runtime._run_dir(run_id) / "shared"
+    shared_dir.mkdir(parents=True)
+    (shared_dir / "index.json").write_text("{invalid", encoding="utf-8")
+    assert runtime.get_agent_context(candidate.agent_session_id)[
+        "tool_family_catalog"
+    ] == []
+
     candidate.write_program_value(1)
     report = SearchTools(runtime).search_run_verifier(
         run_id,
@@ -1319,13 +1653,34 @@ def test_shared_dir_is_disabled_by_default(tmp_path: Path) -> None:
             candidate,
             "Reject impossible shared-tool staging",
             toolization_decision={
-                "outcome": "staged",
-                "signals": ["domain_probe"],
-                "rationale": "Claim a staged tool while sharing is disabled.",
-                "tool_names": ["probe"],
-            },
-        )
+            "outcome": "staged",
+            "signals": ["domain_construction_or_probe"],
+            "rationale": "Claim a staged tool while sharing is disabled.",
+            "tool_names": ["probe"],
+        },
+    )
     assert len(_iterations(runtime, run_id, candidate)) == 1
+
+
+def test_disabled_shared_dir_verifier_skips_shared_tool_settlement(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    runtime, run_id, [candidate, _peer] = _shared_run(tmp_path, enabled=False)
+
+    def fail_shared_settlement(*args, **kwargs):
+        raise AssertionError("disabled shared-dir must not inspect or settle staging")
+
+    monkeypatch.setattr(SharedDirManager, "inspect_staging", fail_shared_settlement)
+    monkeypatch.setattr(SharedDirManager, "settle_iteration", fail_shared_settlement)
+
+    report = _run_worker_verifier(runtime, run_id, candidate, "Verify without sharing")
+
+    assert report.process_passed is True
+    assert report.shared_tool_publish_status == "not_staged"
+    assert report.shared_tool_staged_entries == []
+    assert report.shared_tool_errors == []
+    assert report.toolization_advisories == []
 
 
 def test_torch_cpu_shared_dir_validation_files_cover_publication_and_adoption() -> None:

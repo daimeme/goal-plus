@@ -269,6 +269,30 @@ def test_pi_worker_prompt_requires_runtime_context_and_verifier() -> None:
     assert "candidate-local analysis scripts" not in text
 
 
+def test_pi_goal_plus_skill_uses_the_same_family_revision_contract() -> None:
+    text = (ROOT / ".pi" / "skills" / "goal-plus" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+
+    for expected in (
+        "revision_allowed=true",
+        "revision_head.tool_id",
+        "capability_extension",
+        "adoption_fix",
+        "contract_change",
+        "新增稳定契约键",
+        "不得靠改名或同义键制造增量",
+        "revision_allowed=false",
+        "revision_blocker",
+        "existing_family_sufficient",
+        "no_material_tool_delta",
+        "draft_not_ready",
+        "max_published_versions_reached",
+    ):
+        assert expected in text
+    assert "no_material_tool_delta` 表示没有新增稳定键" in text
+
+
 def test_pi_skill_documents_post_tool_time_advisory() -> None:
     text = (ROOT / ".pi" / "skills" / "goal-plus" / "SKILL.md").read_text(
         encoding="utf-8"
@@ -402,6 +426,32 @@ def test_pi_extension_has_precise_tool_schemas_and_error_classification() -> Non
     assert "metric_direction: Type.Union" in text
     assert "process_verifiers: Type.Array(VerifierCommand" in text
     assert "const SharedDirSpec = Type.Object" in text
+    for signal in [
+        "repeated_workflow",
+        "domain_construction_or_probe",
+        "behavior_or_invariant_checker",
+        "reproducer_fixture_or_case_generator",
+        "parser_trace_or_comparator",
+        "peer_setup_or_feedback_reduction",
+    ]:
+        assert f'Type.Literal("{signal}")' in text
+    decision_schema = text.split("const ToolizationDecision = Type.Object", 1)[1].split(
+        "const SearchSpecSchema = Type.Object", 1
+    )[0]
+    assert "maxItems: 6" in decision_schema
+    for removed_signal in [
+        "repeated_sequence",
+        "domain_probe",
+        "parser_or_trace",
+        "peer_setup_reduction",
+    ]:
+        assert f'Type.Literal("{removed_signal}")' not in text
+    assert 'Type.Literal("max_published_versions_reached")' in text
+    assert "max_pending_revisions_per_family: Type.Optional(Type.Literal(1))" in text
+    assert (
+        "max_published_versions_per_family: "
+        "Type.Optional(Type.Integer({ minimum: 1, maximum: 32 }))"
+    ) in text
     assert "shared_dir: Type.Optional(SharedDirSpec)" in text
     assert "worker_budget: Type.Optional(Type.Union" in text
     assert "min_runtime_seconds: Type.Optional(NullablePositiveInteger)" in text
@@ -415,9 +465,31 @@ def test_pi_extension_has_precise_tool_schemas_and_error_classification() -> Non
     assert "search_get_agent_context:" in text
     assert "search_copy_shared_tool:" in text
     assert "search_stage_shared_tool:" in text
+    stage_schema = text.split("search_stage_shared_tool: Type.Object", 1)[1].split(
+        "search_get_agent_observability: Type.Object", 1
+    )[0]
+    assert "maxItems: 32" in stage_schema
+    assert "maxItems: 64" in stage_schema
+    assert stage_schema.count("uniqueItems: true") == 2
     assert "candidate_task.share_out_dir 非空表示已启用 shared_dir" in text
-    assert "repeated_sequence、domain_probe、parser_or_trace 或 peer_setup_reduction" in text
-    assert "toolization_decision：staged 至少包含一个正向 signal" in text
+    assert "revision_head 指定唯一更新基线" in text
+    assert "revision_allowed、published_version_count" in text
+    assert "revision_allowed=false 时使用 revision_blocker 的准确值" in text
+    assert "adoption_fix 必须有同 family 的真实 copy/adoption 事实" in text
+    assert "不要求制造新键" in text
+    assert "draft_not_ready 只用于具体的安全性" in text
+    assert "供阅读源码或自主复用；复制不要求调用原工具" in text
+    assert "当前 adopted_tools 只证明快照曾复制进本轮上下文" in text
+    assert "toolization_decision 使用 repeated_workflow、domain_construction_or_probe" in text
+    assert "behavior_or_invariant_checker" in text
+    assert "reproducer_fixture_or_case_generator" in text
+    assert "parser_trace_or_comparator" in text
+    assert "peer_setup_or_feedback_reduction" in text
+    assert "搜索期测试文件、功能验证函数、复现、fixture/case、差分和不变量检查可以工具化" in text
+    assert "测试框架、test_ 文件名或验证同一目标行为都不是 restricted_artifact 理由" in text
+    assert "最终交付测试、冻结 verifier/runner/grader、隐藏答案/评分逻辑" in text
+    assert "搜索期测试/checker/harness 可发布" in text
+    assert "toolization_decision：staged 至少包含一个当前 capability-oriented signal" in text
     assert "toolization_review_missing、toolization_stage_missing 或 toolization_decision_mismatch" in text
     assert "初始创建并实际并行工作的候选 Agent 数量" in text
     assert "标准流程令 requested_k 等于 max_parallel" in text
