@@ -36,6 +36,10 @@ from goal_plus.runtime import (
     write_json,
 )
 from goal_plus.shared_dir import SharedDirManager
+from goal_plus.shared_dir_trace import (
+    append_shared_dir_trace,
+    shared_dir_trace_enabled,
+)
 
 
 EVIDENCE_ANNOTATOR_DISABLED_ENV = "GOAL_PLUS_EVIDENCE_ANNOTATOR_DISABLED"
@@ -1291,6 +1295,42 @@ def _worker_owned(
         return False
 
 
+def _trace_terminal_tool_views(
+    runtime: FileSearchRuntime,
+    task: EvidenceAnnotationTask,
+    error: str,
+) -> None:
+    if not shared_dir_trace_enabled():
+        return
+    try:
+        pending_tool_ids = runtime._pending_tool_view_ids(task.run_id)
+        candidate = runtime._load_candidate_record(task.run_id, task.candidate_id)
+        tools = [
+            tool
+            for iteration in candidate.iterations
+            if iteration.iteration == task.iteration
+            for tool in iteration.shared_tools
+            if tool.tool_id in pending_tool_ids
+        ]
+    except Exception:
+        return
+    for tool in tools:
+        append_shared_dir_trace(
+            runtime.root_dir,
+            task.run_id,
+            "tool_view_failed",
+            candidate_id=task.candidate_id,
+            iteration=task.iteration,
+            tool_id=tool.tool_id,
+            snapshot_hash=tool.snapshot_hash,
+            payload={
+                "attempt": task.attempts,
+                "terminal": True,
+                "error": error,
+            },
+        )
+
+
 def _claim_annotation_task(
     runtime: FileSearchRuntime,
     run_id: str,
@@ -1320,6 +1360,7 @@ def _claim_annotation_task(
                     }
                 )
             )
+            _trace_terminal_tool_views(runtime, task, error)
             return None
         now_epoch = time.time()
         deadline = runtime._outer_deadline_epoch(task.outer_deadline_at)
@@ -1337,6 +1378,7 @@ def _claim_annotation_task(
                 }
             )
             runtime._write_evidence_annotation_task(task)
+            _trace_terminal_tool_views(runtime, task, error)
             return None
         retry_at = runtime._outer_deadline_epoch(task.next_attempt_at)
         if retry_at is not None and retry_at > now_epoch:
@@ -1465,6 +1507,19 @@ def _finish_annotation_task(
             or current.state not in {"pending", "retry_wait"}
         ):
             return False
+        trace_tools = []
+        if shared_dir_trace_enabled():
+            pending_tool_ids = runtime._pending_tool_view_ids(current.run_id)
+            candidate_record = runtime._load_candidate_record(
+                current.run_id, current.candidate_id
+            )
+            trace_tools = [
+                tool
+                for iteration_record in candidate_record.iterations
+                if iteration_record.iteration == current.iteration
+                for tool in iteration_record.shared_tools
+                if tool.tool_id in pending_tool_ids
+            ]
         if result is not None:
             deadline = runtime._outer_deadline_epoch(current.outer_deadline_at)
             if not runtime._evidence_annotation_run_active(task.run_id):
@@ -1553,6 +1608,39 @@ def _finish_annotation_task(
         # All runtime readers take the run lock, so they see either the old head
         # or the completed View and its new head together.
         runtime._reconcile_tool_family_heads(current.run_id)
+        if result is not None:
+            if shared_dir_trace_enabled():
+                for tool_view in tool_views:
+                    append_shared_dir_trace(
+                        runtime.root_dir,
+                        current.run_id,
+                        "tool_view_bound",
+                        candidate_id=current.candidate_id,
+                        iteration=current.iteration,
+                        tool_id=tool_view.tool_id,
+                        snapshot_hash=tool_view.snapshot_hash,
+                        payload={
+                            "attempt": current.attempts,
+                            "source_commit": tool_view.source_commit,
+                        },
+                    )
+        else:
+            event_name = "tool_view_failed" if terminal else "tool_view_retry"
+            for tool in trace_tools:
+                append_shared_dir_trace(
+                    runtime.root_dir,
+                    current.run_id,
+                    event_name,
+                    candidate_id=current.candidate_id,
+                    iteration=current.iteration,
+                    tool_id=tool.tool_id,
+                    snapshot_hash=tool.snapshot_hash,
+                    payload={
+                        "attempt": current.attempts,
+                        "terminal": terminal,
+                        "error": error_text,
+                    },
+                )
         return result is not None
 
 
@@ -1649,6 +1737,27 @@ def drain_evidence_annotations(
                                 runtime.root_dir / monitor_path
                             )
                         context["_annotation_attempt"] = task.attempts
+                        for tool in (
+                            context.get("published_tools", [])
+                            if shared_dir_trace_enabled()
+                            else []
+                        ):
+                            if not isinstance(tool, dict) or not tool.get("tool_id"):
+                                continue
+                            append_shared_dir_trace(
+                                runtime.root_dir,
+                                run_id,
+                                "tool_view_started",
+                                candidate_id=candidate_id,
+                                iteration=iteration,
+                                tool_id=str(tool["tool_id"]),
+                                snapshot_hash=(
+                                    str(tool["snapshot_hash"])
+                                    if tool.get("snapshot_hash")
+                                    else None
+                                ),
+                                payload={"attempt": task.attempts},
+                            )
                         result = _annotation_result(
                             selected_annotator.annotate(context)
                         )

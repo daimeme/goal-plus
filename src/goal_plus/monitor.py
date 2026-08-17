@@ -33,6 +33,7 @@ from goal_plus.statistics import (
     build_run_statistics,
 )
 from goal_plus.shared_dir import SharedDirManager
+from goal_plus.shared_dir_trace import summarize_shared_dir_trace
 
 
 def _path_mtime(path: str | None) -> float | None:
@@ -859,6 +860,9 @@ def goal_plus_monitor_snapshot(
                     for family in families
                 ],
             }
+            shared_dir_trace = summarize_shared_dir_trace(root, run.run_id)
+            if shared_dir_trace is not None:
+                run_payload["shared_dir_trace"] = shared_dir_trace
 
         for candidate in candidates:
             candidate_sessions = sessions_by_candidate.get(candidate.candidate_id, [])

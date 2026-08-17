@@ -1098,8 +1098,8 @@ class IterationRecord(SearchModel):
     shared_tools: list[SharedToolRecord] = Field(default_factory=list)
     shared_tool_errors: list[str] = Field(default_factory=list)
     shared_tool_staged_entries: list[str] = Field(default_factory=list)
-    shared_tool_staged_file_count: int = Field(default=0, ge=0)
-    shared_tool_staged_bytes: int = Field(default=0, ge=0)
+    shared_tool_staged_file_count: int | None = Field(default=0, ge=0)
+    shared_tool_staged_bytes: int | None = Field(default=0, ge=0)
     shared_tool_consumed_entries: list[str] = Field(default_factory=list)
     shared_tool_deduplicated_entries: list[str] = Field(default_factory=list)
     shared_tool_publish_status: SharedToolPublishStatus = "legacy_unknown"

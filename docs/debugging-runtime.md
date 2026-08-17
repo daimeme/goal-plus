@@ -28,6 +28,27 @@ verifier iterations. Legacy runs may contain multiple plans.
 Host logs explain what the worker did, while `.gp/` records goal/search facts
 such as candidates, iterations, scores, and verifier output.
 
+## Shared-dir Diagnostic Trace
+
+For a bounded shared-dir experiment, set `GOAL_PLUS_SHARED_DIR_TRACE=1` in the
+MCP server environment. The default is off. The runtime then writes a
+metadata-only append-only trace to
+`.gp/runs/<run_id>/debug/shared-dir-events.jsonl`. It records stage, snapshot,
+Tool View, actual Evidence visibility, copy, receipt-consumption, and verifier
+settlement transitions. It does not contain source contents, prompts,
+transcripts, hidden answers, or worker reasoning, and workers do not read it.
+
+`goal_plus_monitor_snapshot` projects an observational funnel at
+`run.shared_dir_trace` whenever the trace exists. The projection includes
+conversion counts and rates, latency summaries, per-candidate totals, and a
+bounded candidate/tool path table. `copied_receipts` and `consumed_receipts`
+prove snapshot delivery only; they do not prove that peer code was executed,
+adapted, or retained. The raw JSONL remains the detailed diagnostic source.
+
+See [Shared-dir Effectiveness Validation Plan](shared-dir-effectiveness-plan.md)
+for the three-layer campaign, metric definitions, and decision gates. Do not
+commit the trace or other `.gp/` output.
+
 ## Host-Native Log Inspection
 
 Keep raw host logs under `.gp/host-logs/` or another ignored directory. They
@@ -294,6 +315,7 @@ guard events, stop continuation messages, and `.gp/goal-plus/...`.
     │   └── <allowed_files>
     ├── shared/index.json                         # optional runtime-internal tool publication index
     ├── shared/tools/<candidate_id>/<iteration>/  # runtime-owned peer-readable snapshots
+    ├── debug/shared-dir-events.jsonl             # opt-in metadata-only shared-dir diagnostic trace
     ├── agent_sessions/<agent_session_id>.json    # AgentSessionRecord: candidate/host binding, launch payload, counters
     ├── report.md / report.html                   # text and self-contained audit reports
     └── promotion/                                # selected patch outputs

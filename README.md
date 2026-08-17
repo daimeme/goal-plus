@@ -109,6 +109,7 @@ promotion stays retryable in `ready_to_promote` and emits no patch.
 | Current MCP and Pi-local tools | [API](docs/api.md) |
 | Host capability comparison | [Agent Host Adapters](docs/agent-host-adapters.md) |
 | Runtime and host logs | [Debugging](docs/debugging-runtime.md) |
+| Shared-dir effectiveness validation | [Shared-dir Experiment Plan](docs/shared-dir-effectiveness-plan.md) |
 | Specs and runnable examples | [Examples](examples/README.md) |
 | Tests and real-host evidence | [Tests](tests/README.md) |
 

@@ -83,6 +83,10 @@ from goal_plus.shared_dir import (
     TOOL_VIEW_MAX_CONTENT_BYTES,
     SharedDirManager,
 )
+from goal_plus.shared_dir_trace import (
+    append_shared_dir_trace,
+    shared_dir_trace_enabled,
+)
 from goal_plus.workspaces import (
     IGNORED_NAMES,
     IGNORED_SUFFIXES,
@@ -178,8 +182,8 @@ class _SharedToolIterationSettlement:
     tools: list[SharedToolRecord]
     errors: list[str]
     staged_entries: list[str]
-    staged_file_count: int
-    staged_bytes: int
+    staged_file_count: int | None
+    staged_bytes: int | None
     consumed_entries: list[str]
     deduplicated_entries: list[str]
     publish_status: SharedToolPublishStatus
@@ -1836,6 +1840,41 @@ class FileSearchRuntime:
                     }
                 )
             )
+            trace_payload = None
+            if frozen.spec.shared_dir.enabled and shared_dir_trace_enabled():
+                candidate_iteration_count = len(
+                    self._load_candidate_record(
+                        session.run_id, session.candidate_id
+                    ).iterations
+                )
+                trace_payload = {
+                    "candidate_iteration_count": candidate_iteration_count,
+                    "visible_tools": [
+                        {
+                            "tool_id": tool["tool_id"],
+                            "snapshot_hash": tool["snapshot_hash"],
+                            "source_candidate_id": entry["candidate_id"],
+                            "source_iteration": entry["iteration"],
+                            "tool_view_created_at": entry["view_created_at"],
+                        }
+                        for entry in view
+                        for tool in entry.get("shared_tools", [])
+                    ],
+                }
+        if trace_payload is not None:
+            append_shared_dir_trace(
+                self.root_dir,
+                session.run_id,
+                "evidence_returned",
+                candidate_id=session.candidate_id,
+                agent_session_id=session.agent_session_id,
+                iteration=trace_payload["candidate_iteration_count"],
+                payload={
+                    "evidence_count": len(view),
+                    "completed_view_count": len(completed_views),
+                    **trace_payload,
+                },
+            )
         self._kick_evidence_annotator(session.run_id)
         return view
 
@@ -1925,6 +1964,24 @@ class FileSearchRuntime:
         coverage_keys: list[str] | None = None,
     ) -> dict[str, Any]:
         session = self._load_agent_session_by_id(agent_session_id)
+        if shared_dir_trace_enabled():
+            append_shared_dir_trace(
+                self.root_dir,
+                session.run_id,
+                "stage_requested",
+                candidate_id=session.candidate_id,
+                agent_session_id=agent_session_id,
+                payload={
+                    "name": name,
+                    "entrypoint": entrypoint,
+                    "publication_intent": publication_intent,
+                    "supersedes_tool_id": supersedes_tool_id,
+                    "source_paths": list(candidate_relative_source_paths),
+                    "source_path_count": len(candidate_relative_source_paths),
+                    "capability_ids": list(capability_ids or []),
+                    "coverage_keys": list(coverage_keys or []),
+                },
+            )
         lock_path = self._candidate_dir(session.run_id, session.candidate_id) / "verifier.lock"
         with exclusive_file_lock(lock_path):
             with self._run_transaction(session.run_id):
@@ -1941,7 +1998,7 @@ class FileSearchRuntime:
                 if record.task.share_out_dir is None:
                     raise RuntimeError("shared-dir candidate has no share-out directory")
                 limits = frozen.spec.shared_dir
-                return SharedDirManager(self._run_dir(session.run_id)).stage_tool(
+                result = SharedDirManager(self._run_dir(session.run_id)).stage_tool(
                     workspace=record.task.workspace,
                     share_out_dir=record.task.share_out_dir,
                     name=name,
@@ -1958,11 +2015,40 @@ class FileSearchRuntime:
                     max_path_entries=limits.max_path_entries_per_iteration,
                     max_depth=limits.max_depth,
                 )
+        if shared_dir_trace_enabled():
+            append_shared_dir_trace(
+                self.root_dir,
+                session.run_id,
+                "stage_result",
+                candidate_id=session.candidate_id,
+                agent_session_id=agent_session_id,
+                payload={
+                    "status": "ok",
+                    "name": result["name"],
+                    "staged_name": result["staged_name"],
+                    "entrypoint": result["entrypoint"],
+                    "file_count": result["file_count"],
+                    "size_bytes": result["size_bytes"],
+                    "publication_intent": result["publication_intent"],
+                    "supersedes_tool_id": result["supersedes_tool_id"],
+                },
+            )
+        return result
 
     def copy_shared_tool(
         self, agent_session_id: str, tool_id: str, snapshot_hash: str
     ) -> dict[str, Any]:
         session = self._load_agent_session_by_id(agent_session_id)
+        if shared_dir_trace_enabled():
+            append_shared_dir_trace(
+                self.root_dir,
+                session.run_id,
+                "copy_requested",
+                candidate_id=session.candidate_id,
+                agent_session_id=agent_session_id,
+                tool_id=tool_id,
+                snapshot_hash=snapshot_hash,
+            )
         lock_path = self._candidate_dir(session.run_id, session.candidate_id) / "verifier.lock"
         with exclusive_file_lock(lock_path):
             with self._run_transaction(session.run_id):
@@ -1976,7 +2062,9 @@ class FileSearchRuntime:
                     len(record.pending_tool_copies)
                     >= frozen.spec.shared_dir.max_tools_per_iteration
                 ):
-                    raise ValueError("pending tool copies exceed shared_dir max_tools_per_iteration")
+                    raise ValueError(
+                        "pending tool copies exceed shared_dir max_tools_per_iteration"
+                    )
                 if any(item.tool_id == tool_id for item in record.pending_tool_copies):
                     raise ValueError(
                         "tool already copied for the next verifier iteration: "
@@ -2005,6 +2093,22 @@ class FileSearchRuntime:
                 )
                 record.pending_tool_copies.append(receipt)
                 self._write_candidate_record(session.run_id, record)
+        if shared_dir_trace_enabled():
+            append_shared_dir_trace(
+                self.root_dir,
+                session.run_id,
+                "copy_result",
+                candidate_id=session.candidate_id,
+                agent_session_id=agent_session_id,
+                tool_id=tool_id,
+                snapshot_hash=snapshot_hash,
+                payload={
+                    "status": "ok",
+                    "receipt_id": receipt.receipt_id,
+                    "source_commit": receipt.source_commit,
+                    "candidate_base_git_head": receipt.candidate_base_git_head,
+                },
+            )
         return receipt.model_dump(mode="json")
 
     def run_verifier(
@@ -2037,8 +2141,136 @@ class FileSearchRuntime:
                 toolization_decision=toolization_decision,
             )
         if scope == "process" and agent_session_id is not None:
+            self._trace_shared_dir_verifier_settlement(
+                run_id,
+                candidate_id,
+                agent_session_id,
+            )
             self._kick_evidence_annotator(run_id)
         return report
+
+    def _trace_shared_dir_verifier_settlement(
+        self,
+        run_id: str,
+        candidate_id: str,
+        agent_session_id: str,
+    ) -> None:
+        if not shared_dir_trace_enabled():
+            return
+        try:
+            run = self._load_run(run_id)
+            frozen = self._load_frozen_spec(run.frozen_spec_id)
+            if not frozen.spec.shared_dir.enabled:
+                return
+            record = self._load_candidate_record(run_id, candidate_id)
+            iteration = record.iterations[-1]
+            if iteration.agent_session_id != agent_session_id:
+                return
+            baseline = next(
+                (
+                    item
+                    for item in reversed(record.iterations[:-1])
+                    if item.disposition in {"keep", "retain"}
+                    and item.score is not None
+                ),
+                None,
+            )
+            score_delta = (
+                iteration.score - baseline.score
+                if iteration.score is not None
+                and baseline is not None
+                and baseline.score is not None
+                else None
+            )
+            adopted_receipt_ids = [
+                item.receipt_id
+                for item in iteration.adopted_tools
+                if item.receipt_id is not None
+            ]
+            append_shared_dir_trace(
+                self.root_dir,
+                run_id,
+                "verifier_settled",
+                candidate_id=candidate_id,
+                agent_session_id=agent_session_id,
+                iteration=iteration.iteration,
+                payload={
+                    "process_passed": iteration.process_passed,
+                    "score": iteration.score,
+                    "baseline_score": baseline.score if baseline is not None else None,
+                    "score_delta": score_delta,
+                    "metric_direction": frozen.spec.metric_direction,
+                    "disposition": iteration.disposition,
+                    "changed_file_count": len(iteration.attempt_changed_files),
+                    "shared_tool_publish_status": (
+                        iteration.shared_tool_publish_status
+                    ),
+                    "published_tool_ids": [
+                        item.tool_id for item in iteration.shared_tools
+                    ],
+                    "shared_tool_errors": list(iteration.shared_tool_errors),
+                    "adopted_receipt_ids": adopted_receipt_ids,
+                    "adopted_tool_ids": [
+                        item.tool_id for item in iteration.adopted_tools
+                    ],
+                    "adoption_confounded": iteration.adoption_confounded,
+                    "toolization_decision": (
+                        iteration.toolization_decision.model_dump(mode="json")
+                        if iteration.toolization_decision is not None
+                        else None
+                    ),
+                    "toolization_advisories": list(
+                        iteration.toolization_advisories
+                    ),
+                },
+            )
+            for tool in iteration.shared_tools:
+                append_shared_dir_trace(
+                    self.root_dir,
+                    run_id,
+                    "snapshot_published",
+                    candidate_id=candidate_id,
+                    agent_session_id=agent_session_id,
+                    iteration=iteration.iteration,
+                    tool_id=tool.tool_id,
+                    snapshot_hash=tool.snapshot_hash,
+                    payload={
+                        "family_id": tool.family_id,
+                        "version": tool.version,
+                        "publication_intent": tool.publication_intent,
+                        "supersedes_tool_id": tool.supersedes_tool_id,
+                        "source_commit": tool.source_commit,
+                        "file_count": len(tool.files),
+                        "size_bytes": tool.size_bytes,
+                    },
+                )
+            for adopted in iteration.adopted_tools:
+                append_shared_dir_trace(
+                    self.root_dir,
+                    run_id,
+                    "receipt_consumed",
+                    candidate_id=candidate_id,
+                    agent_session_id=agent_session_id,
+                    iteration=iteration.iteration,
+                    tool_id=adopted.tool_id,
+                    snapshot_hash=adopted.snapshot_hash,
+                    payload={
+                        "receipt_id": adopted.receipt_id,
+                        "process_passed": iteration.process_passed,
+                        "score": iteration.score,
+                        "baseline_score": (
+                            baseline.score if baseline is not None else None
+                        ),
+                        "score_delta": score_delta,
+                        "metric_direction": frozen.spec.metric_direction,
+                        "disposition": iteration.disposition,
+                        "adoption_confounded": iteration.adoption_confounded,
+                        "changed_file_count": len(iteration.attempt_changed_files),
+                    },
+                )
+        except Exception:
+            # Trace extraction is diagnostic and cannot invalidate a verifier result.
+            return
 
     def _run_verifier(
         self,
@@ -2380,20 +2612,24 @@ class FileSearchRuntime:
             publish_status = "skipped_unattributed_verifier"
         elif inventory_observed and not report.process_passed:
             publish_status = "skipped_failed_verifier"
+        if shared_settlement is not None:
+            staged_file_count = shared_settlement.staged_file_count
+            staged_bytes = shared_settlement.staged_bytes
+        elif inventory_observed:
+            # Shallow inspection intentionally avoids recursive reads before a
+            # passing attributed verifier, so the observed entry names do not
+            # establish file or byte totals.
+            staged_file_count = None
+            staged_bytes = None
+        else:
+            staged_file_count = 0
+            staged_bytes = 0
         return _SharedToolIterationSettlement(
             tools=(shared_settlement.tools if shared_settlement is not None else []),
             errors=errors,
             staged_entries=staged_entries,
-            staged_file_count=(
-                shared_settlement.staged_file_count
-                if shared_settlement is not None
-                else 0
-            ),
-            staged_bytes=(
-                shared_settlement.staged_bytes
-                if shared_settlement is not None
-                else 0
-            ),
+            staged_file_count=staged_file_count,
+            staged_bytes=staged_bytes,
             consumed_entries=(
                 shared_settlement.consumed_entries
                 if shared_settlement is not None

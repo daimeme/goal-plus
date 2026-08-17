@@ -352,6 +352,142 @@ def test_process_verifier_publishes_share_out_into_global_evidence(
     assert family_monitor["families"][0]["discoverable_version"] == 1
 
 
+def test_shared_dir_trace_funnel_links_visibility_copy_and_settlement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GOAL_PLUS_SHARED_DIR_TRACE", "1")
+    runtime, run_id, [producer, peer] = _shared_run(tmp_path)
+
+    peer.write_program_value(1)
+    _run_worker_verifier(
+        runtime,
+        run_id,
+        peer,
+        "Establish the peer baseline before any shared tool is visible",
+        toolization_decision={
+            "outcome": "not_applicable",
+            "signals": [],
+            "exclusion": "no_material_tool_delta",
+            "rationale": "The baseline does not add a reusable diagnostic.",
+            "tool_names": [],
+        },
+    )
+
+    draft = producer.tool_drafts / "score-helper" / "helper.py"
+    draft.parent.mkdir(parents=True)
+    draft.write_text(
+        "def read_score(text):\n    return float(text.split('=', 1)[1])\n",
+        encoding="utf-8",
+    )
+    runtime.stage_shared_tool(
+        producer.agent_session_id,
+        "score-helper",
+        "Parse the toy score from a source file.",
+        "score-helper/helper.py:read_score",
+        [".tmp/tool-drafts/score-helper"],
+    )
+    producer.write_program_value(2)
+    _run_worker_verifier(
+        runtime,
+        run_id,
+        producer,
+        "Publish the parser after improving the producer",
+        toolization_decision={
+            "outcome": "staged",
+            "signals": ["parser_trace_or_comparator"],
+            "exclusion": None,
+            "rationale": "The parser removes repeated peer setup.",
+            "tool_names": ["score-helper"],
+        },
+    )
+
+    hidden = runtime.get_global_evidence(peer.agent_session_id)
+    assert all(not entry["shared_tools"] for entry in hidden)
+    _publish_pending_views(runtime, run_id)
+    evidence = runtime.get_global_evidence(peer.agent_session_id)
+    [tool] = [
+        tool
+        for entry in evidence
+        for tool in entry["shared_tools"]
+    ]
+    receipt = runtime.copy_shared_tool(
+        peer.agent_session_id,
+        tool["tool_id"],
+        tool["snapshot_hash"],
+    )
+    peer.write_program_value(3)
+    _run_worker_verifier(
+        runtime,
+        run_id,
+        peer,
+        "Apply the copied parser in an isolated improving trial",
+        toolization_decision={
+            "outcome": "not_applicable",
+            "signals": [],
+            "exclusion": "no_material_tool_delta",
+            "rationale": "The adoption trial does not add a new tool contract.",
+            "tool_names": [],
+        },
+    )
+
+    monitor = goal_plus_monitor_snapshot(runtime.root_dir, run_id=run_id)
+    trace = monitor["run"]["shared_dir_trace"]
+    assert trace["malformed_lines"] == 0
+    assert trace["counts"] == {
+        "stage_attempts": 1,
+        "staged_tools": 1,
+        "verifier_settlements": 3,
+        "published_tools": 1,
+        "tool_views_bound": 1,
+        "tool_view_failures": 0,
+        "evidence_reads": 2,
+        "peer_visibility_pairs": 1,
+        "visibility_pairs_followed_by_verifier": 1,
+        "visibility_pairs_without_later_verifier": 0,
+        "copy_attempts": 1,
+        "copied_receipts": 1,
+        "consumed_receipts": 1,
+        "adoption_iterations": 1,
+        "single_non_confounded_adoption_iterations": 1,
+        "isolated_adoption_iterations": 1,
+        "valid_adoption_iterations": 1,
+        "non_degrading_adoption_iterations": 1,
+        "improving_adoption_iterations": 1,
+        "isolated_improving_adoption_iterations": 1,
+        "stage_requests_without_result": 0,
+        "copy_requests_without_result": 0,
+    }
+    assert trace["rates"] == {
+        "stage_to_snapshot": 1.0,
+        "snapshot_to_tool_view": 1.0,
+        "visibility_to_copy": 1.0,
+        "followed_visibility_to_copy": 1.0,
+        "copy_to_receipt_consumption": 1.0,
+        "isolated_to_improvement": 1.0,
+    }
+    [path] = trace["tool_paths"]
+    assert path["tool_id"] == tool["tool_id"]
+    assert path["source_candidate_id"] == producer.candidate_id
+    assert path["peer_candidate_id"] == peer.candidate_id
+    assert path["later_verifier_count"] == 1
+    assert path["receipt_consumed_at"] is not None
+    assert path["adoption_disposition"] == "keep"
+    assert path["adoption_confounded"] is False
+    assert path["adoption_baseline_score"] == 1.0
+    assert path["adoption_score_delta"] == 2.0
+    assert trace["by_candidate"][peer.candidate_id]["visible_peer_tool_ids"] == [
+        tool["tool_id"]
+    ]
+    assert trace["by_candidate"][peer.candidate_id]["consumed_receipts"] == 1
+    assert receipt["receipt_id"] in (
+        runtime.root_dir / "runs" / run_id / "debug" / "shared-dir-events.jsonl"
+    ).read_text(encoding="utf-8")
+    assert "def read_score" not in (
+        runtime.root_dir / "runs" / run_id / "debug" / "shared-dir-events.jsonl"
+    ).read_text(encoding="utf-8")
+
+
 def test_annotator_publishes_bound_tool_view_into_global_evidence(
     tmp_path: Path,
 ) -> None:
@@ -1383,9 +1519,11 @@ def test_newer_pending_revision_cancels_obsolete_tool_view_and_arbitrates_lanes(
 
 def test_terminal_tool_view_failure_keeps_previous_discoverable_head(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from goal_plus.evidence_annotator import PermanentAnnotationError
 
+    monkeypatch.setenv("GOAL_PLUS_SHARED_DIR_TRACE", "1")
     runtime, run_id, [producer, peer] = _shared_run(tmp_path)
     _write_tool(producer.share_out)
     _run_worker_verifier(runtime, run_id, producer, "Publish family v1")
@@ -1424,6 +1562,10 @@ def test_terminal_tool_view_failure_keeps_previous_discoverable_head(
     catalog = runtime.get_agent_context(peer.agent_session_id)["tool_family_catalog"]
     assert catalog[0]["pending_head"] is None
     assert catalog[0]["discoverable_head"]["tool_id"] == v1["tool_id"]
+    trace = goal_plus_monitor_snapshot(runtime.root_dir, run_id=run_id)["run"][
+        "shared_dir_trace"
+    ]
+    assert trace["counts"]["tool_view_failures"] == 1
 
 
 @pytest.mark.skipif(os.name != "nt", reason="directory junctions are Windows-only")
@@ -1574,8 +1716,19 @@ def test_failed_verifier_uses_only_cheap_staging_inventory(
     assert report.process_passed is False
     assert report.shared_tool_publish_status == "skipped_failed_verifier"
     assert report.shared_tool_staged_entries == ["score-helper"]
-    assert report.shared_tool_staged_file_count == 0
+    assert report.shared_tool_staged_file_count is None
+    assert report.shared_tool_staged_bytes is None
     assert (share_out / "score-helper" / "helper.py").is_file()
+
+    [iteration] = _iterations(runtime, run_id, producer)
+    assert iteration["shared_tool_staged_file_count"] is None
+    monitor = goal_plus_monitor_snapshot(runtime.root_dir, run_id=run_id)
+    assert (
+        monitor["candidates"][producer.candidate_id][
+            "shared_tool_staged_file_count_last"
+        ]
+        is None
+    )
 
 
 def test_staging_inspection_failure_is_advisory_to_verifier_evidence(
