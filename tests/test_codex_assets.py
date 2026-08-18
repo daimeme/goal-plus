@@ -309,9 +309,12 @@ def test_codex_worker_agent_calls_context_and_verifier() -> None:
     assert "旧 signal" in text
     assert "测试代码按用途而不是文件名分类" in text
     assert "临时创建的" in text
-    assert "测试文件、功能验证函数" in text
-    assert "文件名以 `test_` 开头或验证同一目标行为" in text
-    assert "candidate 最终交付或主补丁中的正式测试" in text
+    assert "测试文件，以及 candidate" in text
+    assert "文件名以 `test_` 开头、" in text
+    assert "candidate 自己编写并纳入最终交付或主补丁的正式回归测试" in text
+    assert "属于正式测试或验证同一目标行为" in text
+    assert "显式选择的测试及依赖" in text
+    assert "candidate 产品实现" in text
     assert "冻结 verifier/runner/grader" in text
     assert "隐藏答案或评分逻辑" in text
     assert "不得复制、代理或近似重建隐藏" in text
@@ -326,6 +329,7 @@ def test_codex_worker_agent_calls_context_and_verifier() -> None:
         "restricted_artifact",
         "candidate_private_state",
         "duplicate_snapshot",
+        "no_toolizable_material",
         "existing_family_sufficient",
         "no_material_tool_delta",
         "draft_not_ready",
@@ -337,6 +341,7 @@ def test_codex_worker_agent_calls_context_and_verifier() -> None:
     assert "新增至少一个稳定的 capability/coverage 契约键" in text
     assert "键是可机器" in text
     assert "draft_not_ready` 仅表示存在具体的安全性" in text
+    assert "runtime 会在 catalog 尚无 family 时拒绝" in text
     assert "pending_head` 或 `discoverable_head" not in text
     assert "staging inventory 始终是权威事实" in text
     assert "required-column-probe" not in text
@@ -397,9 +402,11 @@ def test_codex_search_reuses_exact_worker_evidence_before_parent_verification() 
     assert "parser_or_trace" not in text
     assert "peer_setup_reduction" not in text
     assert "测试代码按用途而不是文件名分类" in text
-    assert "测试文件、功能验证函数" in text
-    assert "`test_` 文件名或验证同一目标行为都不是 `restricted_artifact` 理由" in text
-    assert "candidate 最终交付或主补丁中的正式测试" in text
+    assert "测试文件，以及 candidate" in text
+    assert "`test_` 文件名、属于正式测试或验证同一" in text
+    assert "candidate 自己编写并纳入最终交付或主补丁的正式回归测试" in text
+    assert "显式选择的测试及依赖" in text
+    assert "candidate 产品实现" in text
     assert "冻结 verifier/runner/grader" in text
     assert "隐藏答案或评分逻辑" in text
     assert "不得复制、代理或近似重建隐藏反馈" in text
@@ -412,6 +419,7 @@ def test_codex_search_reuses_exact_worker_evidence_before_parent_verification() 
         "restricted_artifact",
         "candidate_private_state",
         "duplicate_snapshot",
+        "no_toolizable_material",
         "existing_family_sufficient",
         "no_material_tool_delta",
         "draft_not_ready",
@@ -423,6 +431,7 @@ def test_codex_search_reuses_exact_worker_evidence_before_parent_verification() 
     assert "新增稳定的契约键" in text
     assert "不能靠改名或改写同义键" in text
     assert "draft_not_ready` 仅表示具体的安全性" in text
+    assert "runtime 会在 catalog 尚无 family 时拒绝" in text
     assert "receipt" in text
     assert "Tool View 只用于发现和初筛" in text
     assert "不规定复用方式，也不是采用建议" in text

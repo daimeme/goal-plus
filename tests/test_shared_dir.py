@@ -209,17 +209,20 @@ def test_process_verifier_publishes_share_out_into_global_evidence(
     assert "parser_trace_or_comparator" in instructions
     assert "peer_setup_or_feedback_reduction" in instructions
     assert "测试代码按用途而不是文件名分类" in instructions
-    assert "临时创建的测试文件、功能验证函数" in instructions
-    assert "文件名以 test_ 开头或验证同一目标行为" in instructions
-    assert "candidate 最终交付或主补丁中的正式测试" in instructions
+    assert "candidate 自己编写并纳入最终交付或主补丁的正式回归测试" in instructions
+    assert "属于正式测试或验证同一目标行为" in instructions
+    assert "显式选择的测试及依赖复制到 tool drafts" in instructions
+    assert "candidate 产品实现" in instructions
     assert "冻结 verifier/runner/grader、隐藏答案或评分逻辑" in instructions
-    assert "不得复制、代理或近似重建隐藏反馈" in instructions
+    assert "共享测试不得复制、代理或近似重建隐藏反馈" in instructions
     assert ".tmp/tool-drafts" in instructions
     assert "search_stage_shared_tool" in instructions
     assert "revision_allowed=true" in instructions
     assert "revision_head.tool_id" in instructions
     assert "revision_allowed=false 时使用 revision_blocker 的准确值" in instructions
     assert "max_published_versions_reached" in instructions
+    assert "no_toolizable_material 表示回顾本轮及此前尚未发布的材料后确实没有工具" in instructions
+    assert "runtime 会拒绝首次发布阶段使用这些 revision-only 排除项" in instructions
     assert "capability_extension 必须新增至少一个稳定" in instructions
     assert "adoption_fix 必须有同 family 的真实 copy/adoption 事实" in instructions
     assert "contract_change 必须" in instructions
@@ -352,6 +355,104 @@ def test_process_verifier_publishes_share_out_into_global_evidence(
     assert family_monitor["families"][0]["discoverable_version"] == 1
 
 
+def test_formal_regression_can_publish(
+    tmp_path: Path,
+) -> None:
+    runtime, run_id, [producer, _peer] = _shared_run(tmp_path)
+    draft = producer.tool_drafts / "test_reg.py"
+    draft.parent.mkdir(parents=True)
+    draft.write_text(
+        "from initial_program import VALUE\n\n"
+        "def test_candidate_regression():\n"
+        "    assert VALUE >= 1\n",
+        encoding="utf-8",
+    )
+    runtime.stage_shared_tool(
+        producer.agent_session_id,
+        "regression-check",
+        "Run the candidate-authored formal regression against a peer workspace.",
+        "test_reg.py",
+        [".tmp/tool-drafts/test_reg.py"],
+    )
+    producer.write_program_value(1)
+
+    report = _run_worker_verifier(
+        runtime,
+        run_id,
+        producer,
+        "Publish a passing candidate-authored formal regression test",
+        toolization_decision={
+            "outcome": "staged",
+            "signals": ["behavior_or_invariant_checker"],
+            "rationale": "The formal regression can check the same behavior in peers.",
+            "tool_names": ["regression-check"],
+        },
+    )
+
+    assert report.shared_tool_publish_status == "published"
+    published = _iterations(runtime, run_id, producer)[0]["shared_tools"][0]
+    assert published["files"] == [
+        "manifest.json",
+        "test_reg.py",
+    ]
+
+
+@pytest.mark.parametrize(
+    "exclusion",
+    [
+        "existing_family_sufficient",
+        "no_material_tool_delta",
+        "max_published_versions_reached",
+    ],
+)
+def test_first_toolization_review_rejects_revision_only_exclusions(
+    tmp_path: Path,
+    exclusion: str,
+) -> None:
+    runtime, run_id, [worker, _peer] = _shared_run(tmp_path)
+    worker.write_program_value(1)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            rf"toolization exclusion '{exclusion}' requires an existing shared "
+            "tool family"
+        ),
+    ):
+        _run_worker_verifier(
+            runtime,
+            run_id,
+            worker,
+            "Incorrectly classify a first-publication review as a revision",
+            toolization_decision={
+                "outcome": "not_applicable",
+                "signals": [],
+                "exclusion": exclusion,
+                "rationale": "No revision was produced.",
+                "tool_names": [],
+            },
+        )
+
+    assert _iterations(runtime, run_id, worker) == []
+
+    report = _run_worker_verifier(
+        runtime,
+        run_id,
+        worker,
+        "Record that the cumulative review found no tool",
+        toolization_decision={
+            "outcome": "not_applicable",
+            "signals": [],
+            "exclusion": "no_toolizable_material",
+            "rationale": "The cumulative review found no reusable tool material.",
+            "tool_names": [],
+        },
+    )
+    assert report.process_passed is True
+    assert report.toolization_decision is not None
+    assert report.toolization_decision.exclusion == "no_toolizable_material"
+
+
 def test_shared_dir_trace_funnel_links_visibility_copy_and_settlement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -368,8 +469,8 @@ def test_shared_dir_trace_funnel_links_visibility_copy_and_settlement(
         toolization_decision={
             "outcome": "not_applicable",
             "signals": [],
-            "exclusion": "no_material_tool_delta",
-            "rationale": "The baseline does not add a reusable diagnostic.",
+            "exclusion": "no_toolizable_material",
+            "rationale": "The baseline review found no reusable diagnostic.",
             "tool_names": [],
         },
     )

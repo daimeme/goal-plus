@@ -284,13 +284,15 @@ def test_pi_goal_plus_skill_uses_the_same_family_revision_contract() -> None:
         "不得靠改名或同义键制造增量",
         "revision_allowed=false",
         "revision_blocker",
+        "no_toolizable_material",
         "existing_family_sufficient",
         "no_material_tool_delta",
         "draft_not_ready",
         "max_published_versions_reached",
     ):
         assert expected in text
-    assert "no_material_tool_delta` 表示没有新增稳定键" in text
+    assert "no_material_tool_delta` 仅用于已有" in text
+    assert "catalog 尚无 family 时拒绝" in text
 
 
 def test_pi_skill_documents_post_tool_time_advisory() -> None:
@@ -485,10 +487,12 @@ def test_pi_extension_has_precise_tool_schemas_and_error_classification() -> Non
     assert "reproducer_fixture_or_case_generator" in text
     assert "parser_trace_or_comparator" in text
     assert "peer_setup_or_feedback_reduction" in text
-    assert "搜索期测试文件、功能验证函数、复现、fixture/case、差分和不变量检查可以工具化" in text
-    assert "测试框架、test_ 文件名或验证同一目标行为都不是 restricted_artifact 理由" in text
-    assert "最终交付测试、冻结 verifier/runner/grader、隐藏答案/评分逻辑" in text
-    assert "搜索期测试/checker/harness 可发布" in text
+    assert "candidate 自己编写并纳入最终交付的正式回归测试" in text
+    assert "测试框架、test_ 文件名、属于正式测试或验证同一目标行为" in text
+    assert "candidate 产品实现、冻结 verifier/runner/grader、隐藏答案/评分逻辑" in text
+    assert "正式回归测试可发布" in text
+    assert "no_toolizable_material 表示累计回顾后确实没有工具" in text
+    assert "catalog 尚无 family 时拒绝" in text
     assert "toolization_decision：staged 至少包含一个当前 capability-oriented signal" in text
     assert "toolization_review_missing、toolization_stage_missing 或 toolization_decision_mismatch" in text
     assert "初始创建并实际并行工作的候选 Agent 数量" in text

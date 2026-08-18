@@ -79,6 +79,7 @@ ToolizationExclusion = Literal[
     "restricted_artifact",
     "candidate_private_state",
     "duplicate_snapshot",
+    "no_toolizable_material",
     "existing_family_sufficient",
     "no_material_tool_delta",
     "draft_not_ready",

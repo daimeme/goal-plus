@@ -129,11 +129,13 @@ published yet; workers continue independently and do not wait or poll.
 New decisions use the capability-oriented signals `repeated_workflow`,
 `domain_construction_or_probe`, `behavior_or_invariant_checker`,
 `reproducer_fixture_or_case_generator`, `parser_trace_or_comparator`, and
-`peer_setup_or_feedback_reduction`. Search-local tests, validation functions, reproducers, fixtures/case generators,
-comparators, and invariant checks are eligible tools even when they use a test framework or
-`test_` filename. `restricted_artifact` applies instead to tests intended for the final candidate
-deliverable, frozen verifier/runner/grader artifacts, hidden answers or scoring logic, raw logs/data,
-credentials, and build output. A diagnostic tool must not copy or approximate hidden feedback.
+`peer_setup_or_feedback_reduction`. Search-local tests and candidate-authored formal regression tests,
+validation functions, reproducers, fixtures/case generators, comparators, and invariant checks are eligible
+tools even when they use a test framework, have a `test_` filename, or ship in the final candidate patch.
+Selected tests and dependencies are still copied explicitly under `.tmp/tool-drafts/` and must run in a peer
+workspace without candidate-private temporary state. `restricted_artifact` applies instead to candidate product
+implementation, frozen verifier/runner/grader artifacts, hidden answers or scoring logic, raw logs/data,
+credentials, and build output. A shared test or diagnostic tool must not copy or approximate hidden feedback.
 `strategy.config.global_evidence_mode` controls Evidence delivery without
 changing the candidate-visible prompt or tool surface. `manual` is the default:
 candidates explicitly read the shared run view. `auto` also injects that shared
@@ -175,6 +177,9 @@ observed after copying/adopting that family; `contract_change` adds a stable con
 entrypoint, input, output, or dependency change. Renamed or synonymous keys do not create novelty.
 When `revision_allowed=false`, the worker records the exact `revision_blocker`, such as
 `max_published_versions_reached`, instead of claiming that the current family is sufficient.
+`no_toolizable_material` means the cumulative unpublished review found no tool at all.
+`no_material_tool_delta`, `existing_family_sufficient`, and `max_published_versions_reached` are revision-only
+exclusions and runtime rejects them while the run has no shared-tool family.
 The runtime permits one pending revision and at most two immutable published
 records per family by default; pending records count toward that limit. It keeps only the single
 `discoverable_head` visible in Global Evidence while its successor awaits Tool View settlement.

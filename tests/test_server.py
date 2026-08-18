@@ -145,6 +145,8 @@ def test_run_verifier_exposes_optional_agent_session_id(tmp_path: Path) -> None:
     assert signal_schema["description"] == (
         "Use the six capability-oriented toolization signals."
     )
+    exclusion_schema = decision_schema["properties"]["exclusion"]["anyOf"][0]
+    assert "no_toolizable_material" in exclusion_schema["enum"]
     assert tools["search_copy_shared_tool"].parameters["required"] == [
         "agent_session_id",
         "tool_id",
@@ -169,8 +171,10 @@ def test_run_verifier_exposes_optional_agent_session_id(tmp_path: Path) -> None:
     assert "adoption_fix 必须有同 family 的真实" in stage_description
     assert "contract_change 必须" in stage_description
     assert "不得靠改名或同义键制造增量" in stage_description
-    assert "搜索期间的测试/checker/harness 可以 staging" in stage_description
-    assert "最终交付测试、冻结 verifier/runner/grader" in stage_description
+    assert "搜索期间的测试/checker/harness" in stage_description
+    assert "正式回归测试可以 staging" in stage_description
+    assert "candidate 产品实现、冻结" in stage_description
+    assert "共享测试不得复制、代理" in stage_description
     assert tools["search_get_global_evidence"].parameters["required"] == [
         "agent_session_id"
     ]

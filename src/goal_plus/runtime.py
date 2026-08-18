@@ -2316,6 +2316,27 @@ class FileSearchRuntime:
             and not frozen.spec.shared_dir.enabled
         ):
             raise ValueError("toolization_decision requires shared_dir.enabled=true")
+        if (
+            normalized_toolization_decision is not None
+            and normalized_toolization_decision.outcome == "not_applicable"
+            and normalized_toolization_decision.exclusion
+            in {
+                "existing_family_sufficient",
+                "no_material_tool_delta",
+                "max_published_versions_reached",
+            }
+            and not SharedDirManager(self._run_dir(run_id)).tool_family_catalog(
+                max_published_versions_per_family=(
+                    frozen.spec.shared_dir.max_published_versions_per_family
+                )
+            )
+        ):
+            raise ValueError(
+                "toolization exclusion "
+                f"{normalized_toolization_decision.exclusion!r} requires an existing "
+                "shared tool family; use 'no_toolizable_material' when no reusable "
+                "tool material exists"
+            )
         record = self._load_candidate_record(run_id, candidate_id)
         if record.status not in {"created", "evaluated"}:
             raise RuntimeError(
@@ -3998,9 +4019,9 @@ class FileSearchRuntime:
             instructions.extend(
                 [
                     "shared_dir 发布方规则：工具化的目标是降低同一 run 内其他 candidate 重建诊断、验证或检查流程的成本，不要求跨项目通用。每次 verifier 前回顾本轮及此前 iteration 的命令序列、临时代码片段、测试代码和 scratch scripts。能在 peer workspace 运行、不依赖当前 candidate 临时私有状态，并命中至少一个正向信号时，默认提炼为最小工具：repeated_workflow（等价多步命令/操作流程至少两次）、domain_construction_or_probe（非显然领域对象/状态构造、边界、配置或兼容性探测）、behavior_or_invariant_checker（功能验证函数、断言集合或正确性、性能、资源及状态不变量检查）、reproducer_fixture_or_case_generator（最小复现、fixture、输入、corpus 或 case 生成）、parser_trace_or_comparator（解析/转换、trace/日志归一化、差分/状态比较、mutation 或失败分析）、peer_setup_or_feedback_reduction（setup/cleanup、环境 harness 或明显缩短 peer 本地反馈循环）。",
-                    "测试代码按用途而不是文件名分类。搜索期间临时创建的测试文件、功能验证函数、最小复现、fixture/case 生成器、差分或不变量检查都可以工具化；不得仅因使用测试框架、文件名以 test_ 开头或验证同一目标行为而把它们视为 restricted_artifact。restricted_artifact 只包括 candidate 最终交付或主补丁中的正式测试、冻结 verifier/runner/grader、隐藏答案或评分逻辑，以及日志、原始数据、凭据和构建输出；诊断工具不得复制、代理或近似重建隐藏反馈。正式测试中的可复用诊断逻辑应提取为最小 checker/harness，而不是发布最终测试文件本身。",
+                    "测试代码按用途而不是文件名分类。搜索期间临时创建的测试文件，以及 candidate 自己编写并纳入最终交付或主补丁的正式回归测试、配套 fixture/case generator、功能验证函数、差分或不变量检查，都可以作为共享工具；不得仅因使用测试框架、文件名以 test_ 开头、属于正式测试或验证同一目标行为而把它们视为 restricted_artifact。发布时仍须将显式选择的测试及依赖复制到 tool drafts，并确保它能在 peer workspace 运行且不依赖 candidate 私有临时状态。restricted_artifact 只包括 candidate 产品实现、冻结 verifier/runner/grader、隐藏答案或评分逻辑，以及日志、原始数据、凭据和构建输出；共享测试不得复制、代理或近似重建隐藏反馈。",
                     f"将显式源文件放在 {TOOL_DRAFTS_RELATIVE_PATH}/，再调用 search_stage_shared_tool 生成 {SHARE_OUT_RELATIVE_PATH}/ staging。首次发布使用 publication_intent=new 并保持低门槛，不要因为工具短、任务专属、来自 inline code 或只产生退出码而拒绝。更新已有 family 前读取 tool_family_catalog；仅当 revision_allowed=true 时，引用 revision_head.tool_id 作为 supersedes_tool_id。capability_extension 必须新增至少一个稳定的 capability_ids/coverage_keys；adoption_fix 必须有同 family 的真实 copy/adoption 事实及其暴露的具体缺陷；contract_change 必须为有价值的入口、输入、输出或依赖变化新增至少一个稳定的 capability/coverage 契约键。键是可机器比较的语义标识，不能靠改名或改写同义键制造增量。纯改名、重排或同义断言不得发布。",
-                    "排除项必须具体：revision_allowed=false 时使用 revision_blocker 的准确值（例如 max_published_versions_reached）；existing_family_sufficient 仅表示 revision_head 已覆盖该 peer 需求；no_material_tool_delta 表示没有新增稳定键、adoption 证据支持的缺陷修复或结构化契约增量；draft_not_ready 仅表示存在具体的安全性、完整性、可移植性或 peer 可运行性阻塞，工具短、任务专属、来自 inline code 或尚未润色都不构成该排除项。",
+                    "排除项必须具体：no_toolizable_material 表示回顾本轮及此前尚未发布的材料后确实没有工具；它与已有 family 没有实质 revision 增量不同。revision_allowed=false 时使用 revision_blocker 的准确值（例如 max_published_versions_reached）；existing_family_sufficient 仅表示 revision_head 已覆盖该 peer 需求；no_material_tool_delta 仅用于已有 shared-tool family，表示没有新增稳定键、adoption 证据支持的缺陷修复或结构化契约增量。runtime 会拒绝首次发布阶段使用这些 revision-only 排除项。draft_not_ready 仅表示存在具体的安全性、完整性、可移植性或 peer 可运行性阻塞，工具短、任务专属、来自 inline code 或尚未润色都不构成该排除项。",
                     "每次归属于当前 worker 的 process verifier 都提交 toolization_decision。staged 至少列出一个正向 signal 和实际 tool_names；not_applicable 必须给出具体 exclusion，不能只写不可复用。runtime 以 staging inventory 和 publication settlement 为权威；决策缺失或与 staging 不匹配只生成 monitor/report advisory，不改变 score、disposition、selection 或 promotion。",
                     "shared_dir 采用方规则：工具只有在 annotator 生成并由 runtime 绑定 Tool View 后才会出现在 Global Evidence。Tool View 只用于发现和初筛，不规定复用方式，也不是采用建议；不要仅凭 Tool View 推断源码行为。",
                     "若工具可能相关，通过 search_copy_shared_tool 和准确的 tool_id、snapshot_hash 复制精确快照。复制本身不要求调用原工具；先阅读 manifest、入口和源码，再自行决定直接执行或导入、提取并改写局部逻辑、复用诊断方法、作为实现对照，或不采用；这些示例不限制其他合理方式。",

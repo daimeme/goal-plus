@@ -227,21 +227,26 @@ workspace 运行且不依赖 candidate 私有临时状态的能力，只要命�
 `parser_trace_or_comparator`（解析/转换、trace/日志归一化、差分/状态比较、mutation 或失败分析）和
 `peer_setup_or_feedback_reduction`（setup/cleanup、环境 harness 或更短的本地反馈循环）。旧 signal
 仅用于读取历史 iteration，新决策不要使用。测试代码按用途而不是文件名分类：搜索期间临时创建的
-测试文件、功能验证函数、最小复现、fixture/case 生成器、差分或不变量检查可以工具化；使用测试框架、
-`test_` 文件名或验证同一目标行为都不是 `restricted_artifact` 理由。`restricted_artifact` 只包括
-candidate 最终交付或主补丁中的正式测试、冻结 verifier/runner/grader、隐藏答案或评分逻辑，以及日志、
-原始数据、凭据和构建输出；诊断工具不得复制、代理或近似重建隐藏反馈。正式测试中的可复用诊断逻辑
-应提取为最小 checker/harness，而不是发布最终测试文件本身。首次发布使用 `publication_intent=new` 并保持
+测试文件，以及 candidate 自己编写并纳入最终交付或主补丁的正式回归测试、配套 fixture/case 生成器、
+功能验证函数、差分或不变量检查可以工具化；使用测试框架、`test_` 文件名、属于正式测试或验证同一
+目标行为都不是 `restricted_artifact` 理由。发布时仍须把显式选择的测试及依赖复制到
+`.tmp/tool-drafts/`，并确保它能在 peer workspace 运行且不依赖 candidate 私有临时状态。
+`restricted_artifact` 只包括 candidate 产品实现、冻结 verifier/runner/grader、隐藏答案或评分逻辑，
+以及日志、原始数据、凭据和构建输出；共享测试或诊断工具不得复制、代理或近似重建隐藏反馈。
+首次发布使用 `publication_intent=new` 并保持
 低门槛。更新已有 family 前读取 `tool_family_catalog`；仅当 `revision_allowed=true` 时引用
 `revision_head.tool_id`。`capability_extension` 必须新增稳定 capability/coverage key；
 `adoption_fix` 必须有同 family 的真实 copy/adoption 事实及具体缺陷；`contract_change` 必须为有价值
 的入口、输入、输出或依赖变化新增稳定的契约键。键是可机器比较的语义标识，不能靠改名或改写同义键
 制造增量。纯改名、重排或同义断言不得发布。只有 `single_common_command`、`logic_free_wrapper`、
-`restricted_artifact`、`candidate_private_state`、`duplicate_snapshot`、
+`restricted_artifact`、`candidate_private_state`、`duplicate_snapshot`、`no_toolizable_material`、
 `existing_family_sufficient`、`no_material_tool_delta`、`draft_not_ready`、`max_published_versions_reached`
-这些具体排除项才支持 `not_applicable`。`revision_allowed=false` 时使用 `revision_blocker` 的准确值；
-`existing_family_sufficient` 仅表示 `revision_head` 已经覆盖需求；`no_material_tool_delta` 表示没有上述
-实质增量；`draft_not_ready` 仅表示具体的安全性、
+这些具体排除项才支持 `not_applicable`。`no_toolizable_material` 表示回顾本轮及此前尚未发布的材料后
+确实没有工具；它与已有 family 没有实质 revision 增量不同。首次发布阶段不得使用 revision-only
+排除项；runtime 会在 catalog 尚无 family 时拒绝 `existing_family_sufficient`、
+`no_material_tool_delta` 和 `max_published_versions_reached`。`revision_allowed=false` 时使用 `revision_blocker` 的准确值；
+`existing_family_sufficient` 仅表示 `revision_head` 已经覆盖需求；`no_material_tool_delta` 仅用于已有
+shared-tool family，表示没有上述实质增量；`draft_not_ready` 仅表示具体的安全性、
 完整性、可移植性或 peer 可运行性阻塞，不能用短小、任务专属、inline 来源或未润色作为理由。
 每次归属于 worker 的 process verifier 都提交
 `toolization_decision`；缺失或与实际 staging 不匹配只记录 monitor/report advisory，不改变硬分、

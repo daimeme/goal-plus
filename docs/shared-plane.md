@@ -143,13 +143,14 @@ candidate 可以同时读取同一版 Evidence 并并发工作。
 只要求同一 run 内的其他 candidate 有用，不要求跨项目通用；短小、任务专属、来自临时代码片段或只输出退出码都不能单独
 作为低价值理由。
 
-测试代码按用途而不是路径、文件名或框架分类。搜索期间创建的测试文件、功能验证函数、最小复现、
-fixture/case 生成器、差分或不变量检查可以作为工具；`test_` 文件名、使用测试框架或验证同一目标
-行为都不是 `restricted_artifact` 理由。该排除项只覆盖 candidate 最终交付或主补丁中的正式测试、
-冻结 verifier/runner/grader、隐藏答案或评分逻辑，以及日志、原始数据、凭据和构建输出。诊断工具
-不得复制、代理或近似重建隐藏反馈；正式测试中的可复用诊断逻辑应提取为最小 checker/harness，
-而不是发布最终测试文件本身。其他具体排除项仍包括单条普通命令、无逻辑 wrapper、依赖 candidate
-私有状态或与已发布快照完全相同。
+测试代码按用途而不是路径、文件名或框架分类。搜索期间创建的测试，以及 candidate 自己编写并纳入
+最终交付或主补丁的正式回归测试、配套 fixture/case 生成器、功能验证函数、差分或不变量检查都可以
+作为工具；`test_` 文件名、使用测试框架、属于正式测试或验证同一目标行为都不是
+`restricted_artifact` 理由。worker 仍须把显式选择的测试及依赖复制到 `.tmp/tool-drafts/`，并确保
+它能在 peer workspace 运行且不依赖 candidate 私有临时状态。该排除项只覆盖 candidate 产品实现、
+冻结 verifier/runner/grader、隐藏答案或评分逻辑，以及日志、原始数据、凭据和构建输出。共享测试或
+诊断工具不得复制、代理或近似重建隐藏反馈。其他具体排除项仍包括单条普通命令、无逻辑 wrapper、
+依赖 candidate 私有状态或与已发布快照完全相同。
 
 首次工具发布保持低门槛，短小 inline probe 仍可进入共享面。每个不可变 `SharedToolRecord`
 同时绑定 runtime 分配的 `family_id` 与递增 `version`。worker 仅在 catalog 的
@@ -157,11 +158,13 @@ fixture/case 生成器、差分或不变量检查可以作为工具；`test_` �
 `capability_extension` 必须新增稳定 capability/coverage key；`adoption_fix` 必须有同 family 的真实
 copy/adoption 事实和具体缺陷；`contract_change` 必须为有价值的入口、输入、输出或依赖变化新增稳定
 契约键。键是机器可比较的语义标识，纯改名、重排、同义断言或改写同义键不构成新版本。
-`revision_allowed=false` 时 worker 使用 catalog 的 `revision_blocker`（例如
+`no_toolizable_material` 表示 worker 回顾本轮及此前尚未发布的材料后确实没有工具。它与已有 family
+没有实质 revision 增量不同。`revision_allowed=false` 时 worker 使用 catalog 的 `revision_blocker`（例如
 `max_published_versions_reached`）作为具体排除事实。`existing_family_sufficient` 仅表示
 `revision_head` 已覆盖
-需求；`no_material_tool_delta` 表示没有上述
-实质增量；`draft_not_ready` 仅表示具体的安全性、完整性、可移植性或 peer 可运行性阻塞。
+需求；`no_material_tool_delta` 仅用于已有 shared-tool family，表示没有上述实质增量。runtime 在
+catalog 尚无 family 时拒绝这三个 revision-only 排除项。`draft_not_ready` 仅表示具体的安全性、
+完整性、可移植性或 peer 可运行性阻塞。
 
 `SharedToolFamily` 保存一个 `pending_head` 和一个 `discoverable_head`。新 revision 等待 Tool View 时，
 Global Evidence 继续暴露旧 discoverable head；Tool View 成功后 runtime 原子切换 head，失败则清空

@@ -286,8 +286,10 @@ def create_mcp(
         """将显式的 candidate tool drafts 安全复制到下一次 verifier staging。
 
         source paths 必须位于当前 candidate 的 `.tmp/tool-drafts/` 下。首次发布使用
-        publication_intent=new。搜索期间的测试/checker/harness 可以 staging；candidate
-        最终交付测试、冻结 verifier/runner/grader、隐藏答案或评分逻辑不可 staging。
+        publication_intent=new。搜索期间的测试/checker/harness，以及 candidate 自己编写
+        并纳入最终交付的正式回归测试可以 staging；candidate 产品实现、冻结
+        verifier/runner/grader、隐藏答案或评分逻辑不可 staging。共享测试不得复制、代理
+        或近似重建隐藏反馈。
         family 更新仅在 tool_family_catalog 的
         revision_allowed=true 时引用 revision_head.tool_id：capability_extension 必须
         新增稳定 capability/coverage key；adoption_fix 必须有同 family 的真实

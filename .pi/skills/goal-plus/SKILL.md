@@ -358,14 +358,22 @@ process verifier 同时返回 candidate-local `disposition`：严格改善为 `k
 process verifier 中提交 `toolization_decision`。决策与 advisory 只进入 iteration、monitor 和
 report；实际 staging inventory 与 passing verifier settlement 始终是发布权威，决策本身不进入
 Global Evidence，也不改变 hard score、结算、选择或 promotion。
+candidate 自己编写并纳入最终交付的正式回归测试及配套 fixture 可以发布，但仍须把显式选择的测试
+及依赖复制到 `.tmp/tool-drafts/`，确保它能在 peer workspace 运行且不依赖 candidate 私有临时状态。
+candidate 产品实现、冻结 verifier/runner/grader、隐藏答案或评分逻辑仍不可发布；共享测试不得复制、
+代理或近似重建隐藏反馈。
 首次工具发布保持低门槛。`search_get_agent_context` 的 `tool_family_catalog` 只暴露 family/head
 身份、版本容量和累计能力/覆盖键，不含路径或源码；更新已有 family 仅在 `revision_allowed=true`
 时引用 `revision_head.tool_id`。`capability_extension` 必须新增稳定 capability/coverage key；
 `adoption_fix` 必须有同 family 的真实 copy/adoption 事实及具体缺陷；`contract_change` 必须为有价值
 的入口、输入、输出或依赖变化新增稳定契约键。不得靠改名或同义键制造增量；`revision_allowed=false`
-时使用 `revision_blocker` 的准确值 `max_published_versions_reached`；`existing_family_sufficient` 仅表示
-`revision_head` 已覆盖需求，`no_material_tool_delta` 表示没有新增稳定键、adoption 证据支持的缺陷修复
-或结构化契约增量，`draft_not_ready` 只用于
+时使用 `revision_blocker` 的准确值 `max_published_versions_reached`。`no_toolizable_material` 表示回顾
+本轮及此前尚未发布的材料后确实没有工具；它与已有 family 没有实质 revision 增量不同。首次发布
+阶段不得使用 revision-only 排除项；runtime 会在 catalog 尚无 family 时拒绝
+`existing_family_sufficient`、`no_material_tool_delta` 和 `max_published_versions_reached`。
+`existing_family_sufficient` 仅表示 `revision_head` 已覆盖需求，`no_material_tool_delta` 仅用于已有
+shared-tool family，表示没有新增稳定键、adoption 证据支持的缺陷修复或结构化契约增量，
+`draft_not_ready` 只用于
 具体的安全性、完整性、可移植性或 peer 可运行性阻塞。同一 family 默认只有一个 pending revision
 和一个 discoverable head；新 Tool View 成功前继续暴露旧 head。
 

@@ -132,6 +132,15 @@ def test_toolization_decision_enforces_positive_signals_and_exclusions() -> None
 
     assert staged.rationale == "Encodes a repeated trace workflow."
     assert not_applicable.exclusion == "single_common_command"
+    assert ToolizationDecision.model_validate(
+        {
+            "outcome": "not_applicable",
+            "signals": [],
+            "exclusion": "no_toolizable_material",
+            "rationale": "The cumulative review found no reusable tool material.",
+            "tool_names": [],
+        }
+    ).exclusion == "no_toolizable_material"
     current_signals = [
         "repeated_workflow",
         "domain_construction_or_probe",
