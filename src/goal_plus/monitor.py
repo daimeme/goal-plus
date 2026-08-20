@@ -825,6 +825,20 @@ def goal_plus_monitor_snapshot(
             "budget_used": run.budget_used,
             "evidence_annotations": _evidence_annotation_payload(run_path),
         }
+        decision_paths = sorted(
+            (run_path / "allocation-decisions").glob("allocation_*.json")
+        )
+        allocation_decisions = [load_json(path) for path in decision_paths]
+        run_payload["allocation_decisions"] = {
+            "total": len(allocation_decisions),
+            "pending": sum(
+                item.get("status") == "pending" for item in allocation_decisions
+            ),
+            "applied": sum(
+                item.get("status") == "applied" for item in allocation_decisions
+            ),
+            "items": allocation_decisions,
+        }
 
         for candidate in candidates:
             candidate_sessions = sessions_by_candidate.get(candidate.candidate_id, [])
@@ -865,6 +879,14 @@ def goal_plus_monitor_snapshot(
                 "parent_id": candidate.task.parent_id,
                 "parent_candidate_ids": candidate.task.parent_candidate_ids,
                 "base_candidate_id": candidate.task.base_candidate_id,
+                "allocation_depth": candidate.task.allocation_depth,
+                "allocation_eligibility": candidate.allocation_eligibility,
+                "retired_by_decision_id": candidate.retired_by_decision_id,
+                "expansion_source": (
+                    candidate.task.expansion_source.model_dump(mode="json")
+                    if candidate.task.expansion_source is not None
+                    else None
+                ),
                 "agent_session_count": len(candidate_sessions),
                 "process_dispatch_count": sum(
                     int(session.host_handle.metadata.get("dispatch_count") or 1)
@@ -877,6 +899,21 @@ def goal_plus_monitor_snapshot(
                 ),
                 "last_verifier_at": last_iteration.created_at if last_iteration else None,
                 "last_git_head": last_iteration.git_head if last_iteration else None,
+                "last_reward_evaluation": (
+                    last_iteration.reward_evaluation.model_dump(mode="json")
+                    if last_iteration and last_iteration.reward_evaluation is not None
+                    else None
+                ),
+                "last_allocation_decision_id": (
+                    last_iteration.allocation_decision_id
+                    if last_iteration
+                    else None
+                ),
+                "last_allocation_decision_error": (
+                    last_iteration.allocation_decision_error
+                    if last_iteration
+                    else None
+                ),
                 "best_iteration": best_iteration.iteration if best_iteration else None,
                 "best_iteration_score": best_iteration.score if best_iteration else None,
                 "best_iteration_at": best_iteration.created_at if best_iteration else None,

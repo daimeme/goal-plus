@@ -716,9 +716,13 @@ def _event_from_job(
         worker_budget.get(field) is not None
         for field in ("min_runtime_seconds", "min_verifier_runs")
     )
+    lease_released_by_allocation = (
+        isinstance(lease, dict)
+        and lease.get("release_reason") == "allocation_decision"
+    )
     lease_unsatisfied = (lease_required or lease is not None) and not (
         isinstance(lease, dict) and lease.get("satisfied") is True
-    )
+    ) and not lease_released_by_allocation
     kind: Literal["candidate_ready", "failed", "interrupted", "timed_out"]
     if status == "completed" and not lease_unsatisfied:
         kind = "candidate_ready"
@@ -1041,6 +1045,17 @@ def run_pool_worker(
                 runtime_complete = elapsed >= min_runtime_seconds
                 verifier_complete = verifier_runs >= min_verifier_runs
                 lease_satisfied = runtime_complete and verifier_complete
+                final_score_report = result.get("final_score_report")
+                allocation_decision = (
+                    final_score_report.get("allocation_decision")
+                    if isinstance(final_score_report, dict)
+                    else None
+                )
+                if isinstance(allocation_decision, dict) and allocation_decision.get(
+                    "decision_id"
+                ):
+                    release_reason = "allocation_decision"
+                    break
                 if elapsed >= max_runtime_seconds:
                     release_reason = "max_runtime_reached"
                     break
@@ -1093,6 +1108,11 @@ def run_pool_worker(
                     "agent_session_ids": agent_session_ids,
                     "session_refreshes": session_refreshes,
                     "pending_session_refresh_reason": refresh_next_reason,
+                    "allocation_decision_id": (
+                        allocation_decision.get("decision_id")
+                        if isinstance(allocation_decision, dict)
+                        else None
+                    ),
                 },
             }
         except _PoolWorkerInterrupted:
@@ -1135,7 +1155,7 @@ def run_pool_worker(
             job = _load_job(root_dir, pool_id, job_id)
             terminal_status = (
                 "completed"
-                if lease_satisfied
+                if lease_satisfied or release_reason == "allocation_decision"
                 else "timed_out"
                 if release_reason == "max_runtime_reached"
                 else "interrupted"

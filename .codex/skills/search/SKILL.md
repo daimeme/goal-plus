@@ -59,6 +59,51 @@ strategy:
 父 agent 是完成验证器和继续触发器，不是搜索指挥者。低分、一次没有改进的迭代或其他候选
 领先，都不是停止或替换 worker 的理由。
 
+## Adaptive Search 契约
+
+只有 FrozenSpec 显式设置以下配置时，才启用第一版自适应分配：
+
+```yaml
+budget:
+  max_parallel: 4
+  max_candidates: 8
+strategy:
+  orchestration_mode: adaptive_search
+  adaptive_search:
+    reward: {name: metric_progress, version: 1, params: {}}
+    allocation: {name: low_reward_replace, version: 1, params: {}}
+    expansion:
+      source_policy: highest_value
+      model_policy: inherit_source
+      max_depth: 3
+workspace:
+  backend: git_worktree
+```
+
+`max_parallel` 是任一时刻的 live worker 上限，`max_candidates` 是整个 run 可物化的唯一
+candidate 上限。reward evaluator 在 verifier 结算后运行；allocation policy 只读取单个候选的
+连续 reward 与已持久化候选状态。两者都是 runtime 中按 name/version 注册的可替换组件。
+reward 或 policy 错误只记录到 iteration，不能改变硬 score、candidate settlement、选择或
+promotion。annotation task 注册与 reward/allocation 是互不依赖的结算后分支：任一侧失败不阻止
+另一侧，缺失 task 会从已持久化 iteration 幂等补齐。
+
+当 worker verifier 返回 `allocation_decision` 时，当前 candidate 已被 runtime fence。父 agent
+完成该 worker 的终态绑定后，调用 `search_list_allocation_decisions(status="pending")`，再对准确
+decision 调用一次幂等的 `search_apply_allocation_decision`。只执行返回的 actions，不自行判断
+剪枝对象、派生来源、模型或预算。apply 会从 decision 固定的 verifier-backed source commit
+创建新 workspace，继承该 source 的 results ledger、run-global Evidence 可见性和 selected model，
+并返回新的 agent session 与 host-native launch payload。把该 payload 映射到 `spawn_agent`，绑定
+返回 handle，并保持 live worker 数不超过 `max_parallel`。
+
+retirement 只 fence 下一轮 candidate iteration。触发 decision 的当前 iteration 必须先完成
+Git/results ledger 结算；annotation task 无论在 decision 前还是 retirement 后注册，都绑定同一条
+Evidence。停止 worker 不会取消 annotator，也不会从 Global Evidence 删除该结果。task 尚未注册或
+View 生成期间允许 `view=null`，父 agent 和 worker 都不等待或轮询 View。
+
+第一版没有价值回传、UCB、动态搜索宽度、探索配额或多候选原子 allocation。`best.json`、
+`search_select` 和 promotion 仍只使用硬 verifier score；reward 只用于 allocation。未返回
+allocation decision 时，继续规则与 `parallel_loops` 相同。
+
 ## Search Run 预算规划
 
 在 `search_freeze_spec` 前选择整个 run 的预算；预算一旦冻结，不能在该 run 内增长。
@@ -77,8 +122,9 @@ strategy:
 
 1. 为 Goal Plus spec draft 调用 `search_freeze_spec`；如果已有合适的冻结 spec，
    则调用 `search_create`。新 spec 必须设置
-   `strategy.orchestration_mode="parallel_loops"`、`worker_host="codex"` 和唯一的
-   `budget.max_parallel`；同时必须显式设置 `workspace.backend="git_worktree"`。
+   默认设置 `strategy.orchestration_mode="parallel_loops"`、`worker_host="codex"` 和唯一的
+   `budget.max_parallel`；显式启用上述 `adaptive_search` 时还必须设置
+   `budget.max_candidates`。两种模式都必须显式设置 `workspace.backend="git_worktree"`。
    只有用户明确要求兼容隔离时才能设置 `copy`。
    用户指定多模型时，先调用 `goal_plus_list_models(host="codex")` 并将唯一匹配冻结到
    `strategy.models`。`models=A,B` 按 `max_parallel` 轮转；用户写
@@ -116,7 +162,9 @@ strategy:
    - 刷新 history/monitor，记录 verifier 支持的全局最佳候选/分数是否变化；
    - 只有出现具体评估契约或基础设施失败时才检查 `verifier_assessment`。诊断稀疏、
      分数低或没有改进不代表 verifier 不充分，也不会阻止继续。
-8. 验证后执行全局停止 policy：
+8. 验证后执行全局停止 policy。`adaptive_search` 下先处理报告中 runtime 已持久化的
+   allocation decision：不要恢复被退休的 worker；应用 decision 并在有 live slot 时启动返回的
+   派生 session。没有 decision 时再执行以下普通 continuation policy：
    - 满足显式成功标准时停止恢复；
    - run 失效或用户停止时停止；
    - 外层剩余时间不足以容纳另一个 worker 轮次和最终收尾时停止；
@@ -182,7 +230,7 @@ strategy:
 `SubagentStop` hook 强制执行的下限 lease。过早的最终回复会被阻止，并在不把控制权交还
 主流程的情况下继续同一个 Codex worker。该 lease active 时，绝不能发送父级 closeout
 消息。不要轮询或休眠；继续“假设 -> 产物 -> verifier”循环。基础设施
-`stop_and_report` 证据会绕过 lease。
+`stop_and_report` 或 runtime 已持久化的 adaptive allocation retirement 会释放 lease。
 
 项目 `PostToolUse` hook 也可能向绑定的候选 worker 提供仅供参考的时间提示。
 可用时它可能使用 `GOAL_PLUS_OUTER_DEADLINE_AT`。它绝不会停止 worker，也不能为主 agent、

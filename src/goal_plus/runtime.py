@@ -33,7 +33,17 @@ from goal_plus.agent_hosts import (
     get_agent_host_adapter,
     portable_strategy_mode,
 )
+from goal_plus.adaptive_search import (
+    AllocationContext,
+    RewardContext,
+    allocation_config_hash,
+    decide_allocation,
+    evaluate_reward,
+    validate_adaptive_search_spec,
+)
 from goal_plus.models import (
+    AllocationAction,
+    AllocationDecision,
     AgentHostHandle,
     AgentSessionRecord,
     BestArtifactRecord,
@@ -44,6 +54,7 @@ from goal_plus.models import (
     EvidenceAnnotationTask,
     FeedbackPolicy,
     EvidenceViewRecord,
+    ExpansionSource,
     FrozenSpec,
     GlobalEvidenceReadRecord,
     GlobalEvidenceViewReference,
@@ -1119,6 +1130,257 @@ class FileSearchRuntime:
         record = self._load_candidate_record(run_id, candidate_id)
         return [it.model_dump(mode="json") for it in record.iterations]
 
+    def list_allocation_decisions(
+        self,
+        run_id: str,
+        status: Literal["pending", "applied"] | None = None,
+    ) -> list[AllocationDecision]:
+        self._load_run(run_id)
+        decisions = self._load_allocation_decisions(run_id)
+        if status is not None:
+            decisions = [item for item in decisions if item.status == status]
+        return decisions
+
+    def apply_allocation_decision(
+        self,
+        run_id: str,
+        decision_id: str,
+    ) -> dict[str, Any]:
+        created_candidate_ids: list[str] = []
+        expansion_actions: dict[str, AllocationAction] = {}
+        with self._run_transaction(run_id):
+            run = self._load_run(run_id)
+            self._assert_worker_iteration_allowed(run, "apply allocation decision")
+            frozen = self._load_frozen_spec(run.frozen_spec_id)
+            if frozen.spec.strategy.orchestration_mode != "adaptive_search":
+                raise RuntimeError(
+                    "allocation decisions require adaptive_search orchestration"
+                )
+            decision = self._load_allocation_decision(run_id, decision_id)
+            if decision.run_id != run_id:
+                raise ValueError("allocation decision belongs to another run")
+
+            for action in decision.actions:
+                if action.kind == "retire_candidate":
+                    assert action.candidate_id is not None
+                    record = self._load_candidate_record(
+                        run_id, action.candidate_id
+                    )
+                    if record.retired_by_decision_id not in {None, decision_id}:
+                        raise RuntimeError(
+                            f"candidate {record.candidate_id} was retired by another decision"
+                        )
+                    record.allocation_eligibility = "retired"
+                    record.retired_by_decision_id = decision_id
+                    self._write_candidate_record(run_id, record)
+                    continue
+                if action.kind != "expand_candidate":
+                    continue
+                assert action.source is not None
+                assert action.new_candidate_id is not None
+                child_id = action.new_candidate_id
+                expansion_actions[child_id] = action
+                child_path = self._candidate_dir(run_id, child_id) / "candidate.json"
+                if child_path.exists():
+                    child = self._load_candidate_record(run_id, child_id)
+                    if child.task.expansion_source != action.source:
+                        raise RuntimeError(
+                            f"candidate {child_id} does not match allocation decision"
+                        )
+                    created_candidate_ids.append(child_id)
+                    continue
+
+                source_record = self._load_candidate_record(
+                    run_id, action.source.candidate_id
+                )
+                if source_record.results_ledger_git_head is None:
+                    raise RuntimeError("expansion source has no settled results ledger")
+                if source_record.task.plan_id is None:
+                    raise RuntimeError("expansion source has no initial plan")
+                plan = self._load_plan(run_id, source_record.task.plan_id)
+                proposal = CandidateProposal(
+                    intent=(
+                        "从已验证父 Evidence 独立派生，刷新共享证据后自主选择下一项假设。"
+                    ),
+                    metadata={
+                        "allocation_decision_id": decision_id,
+                        "expansion_source_candidate_id": action.source.candidate_id,
+                        "expansion_source_iteration": action.source.iteration,
+                    },
+                )
+                slot = int(source_record.task.strategy_metadata.get("slot") or 1)
+                task = self._create_candidate_task(
+                    run=run,
+                    frozen=frozen,
+                    candidate_id=child_id,
+                    plan=plan,
+                    proposal=proposal,
+                    slot=slot,
+                    expansion_source=action.source,
+                    source_record=source_record,
+                )
+                child = CandidateRecord(
+                    candidate_id=child_id,
+                    status="created",
+                    task=task,
+                    results_ledger=self._source_ledger_at_revision(
+                        source_record,
+                        action.source.settled_commit,
+                    ),
+                )
+                self._ensure_results_tsv(child, frozen.spec.metric_name)
+                self._write_candidate_record(run_id, child)
+                run.candidates_total += 1
+                created_candidate_ids.append(child_id)
+
+            if decision.status == "pending":
+                decision = decision.model_copy(
+                    update={"status": "applied", "applied_at": utc_timestamp()}
+                )
+                self._write_allocation_decision(decision)
+            # Recover the aggregate after a partial prior apply where the child
+            # record was durable but run.json had not yet been updated.
+            run.candidates_total = max(
+                run.candidates_total,
+                len(self._load_candidate_records(run_id)),
+            )
+            self._write_run(run)
+
+        sessions: list[AgentSessionRecord] = []
+        for candidate_id in created_candidate_ids:
+            action = expansion_actions[candidate_id]
+            assert action.source is not None
+            sessions.append(
+                self.start_agent_session(
+                    run_id,
+                    candidate_id,
+                    {
+                        "adaptive_expansion": True,
+                        "allocation_decision_id": decision_id,
+                        "expansion_source": action.source.model_dump(mode="json"),
+                        "resume_instruction": (
+                            "先读取权威 candidate context 和当前 Global Evidence，"
+                            "再从已验证初始 incumbent 自主选择下一项假设。"
+                        ),
+                    },
+                    worker_budget=(
+                        action.worker_budget.model_dump(mode="json")
+                        if action.worker_budget is not None
+                        else None
+                    ),
+                )
+            )
+        return {
+            "decision": self._load_allocation_decision(
+                run_id, decision_id
+            ).model_dump(mode="json"),
+            "candidate_tasks": [
+                self._load_candidate_record(run_id, candidate_id).task.model_dump(
+                    mode="json"
+                )
+                for candidate_id in created_candidate_ids
+            ],
+            "agent_sessions": [item.model_dump(mode="json") for item in sessions],
+        }
+
+    def _create_allocation_decision_locked(
+        self,
+        run: RunRecord,
+        frozen: FrozenSpec,
+        record: CandidateRecord,
+        iteration: IterationRecord,
+    ) -> AllocationDecision | None:
+        adaptive_spec = frozen.spec.strategy.adaptive_search
+        reward = iteration.reward_evaluation
+        if (
+            adaptive_spec is None
+            or reward is None
+            or reward.status != "evaluated"
+            or iteration.git_head is None
+        ):
+            return None
+        existing = next(
+            (
+                item
+                for item in self._load_allocation_decisions(run.run_id)
+                if item.trigger_reward_id == reward.reward_id
+            ),
+            None,
+        )
+        if existing is not None:
+            iteration.allocation_decision_id = existing.decision_id
+            return existing
+
+        persisted_records = self._load_candidate_records(run.run_id)
+        records = [
+            record if item.candidate_id == record.candidate_id else item
+            for item in persisted_records
+        ]
+        if not any(item.candidate_id == record.candidate_id for item in records):
+            records.append(record)
+        pending_expansions = sum(
+            action.kind == "expand_candidate"
+            for decision in self._load_allocation_decisions(run.run_id)
+            if decision.status == "pending"
+            for action in decision.actions
+        )
+        max_candidates = frozen.spec.budget.max_candidates
+        if max_candidates is None:
+            return None
+        recommendation = decide_allocation(
+            AllocationContext(
+                adaptive_spec=adaptive_spec,
+                trigger_record=record,
+                records=records,
+                pending_expansions=pending_expansions,
+                max_candidates=max_candidates,
+            )
+        )
+        if recommendation is None:
+            return None
+
+        decision_id = f"allocation_{run.next_allocation_decision_index:04d}"
+        run.next_allocation_decision_index += 1
+        child_id = f"c{run.next_candidate_index:03d}"
+        run.next_candidate_index += 1
+        policy = adaptive_spec.allocation
+        decision = AllocationDecision(
+            decision_id=decision_id,
+            run_id=run.run_id,
+            trigger_candidate_id=record.candidate_id,
+            trigger_iteration=iteration.iteration,
+            trigger_commit=iteration.git_head,
+            trigger_reward_id=reward.reward_id,
+            policy_name=policy.name,
+            policy_version=policy.version,
+            config_hash=allocation_config_hash(adaptive_spec),
+            actions=[
+                AllocationAction(
+                    action_id=f"{decision_id}:retire",
+                    kind="retire_candidate",
+                    candidate_id=recommendation.retire_candidate_id,
+                    reason=recommendation.reason,
+                ),
+                AllocationAction(
+                    action_id=f"{decision_id}:expand",
+                    kind="expand_candidate",
+                    source=recommendation.source,
+                    new_candidate_id=child_id,
+                    worker_budget=adaptive_spec.expansion.worker_budget,
+                    reason=(
+                        "replace the retired lane from the highest-value "
+                        "verifier-backed source"
+                    ),
+                ),
+            ],
+            created_at=utc_timestamp(),
+        )
+        record.allocation_eligibility = "retired"
+        record.retired_by_decision_id = decision_id
+        iteration.allocation_decision_id = decision_id
+        self._write_allocation_decision(decision)
+        return decision
+
     def plan_next(self, run_id: str, requested_k: int = 4) -> SearchPlan:
         with self._run_transaction(run_id):
             return self._plan_next_locked(run_id, requested_k)
@@ -1351,6 +1613,10 @@ class FileSearchRuntime:
             raise RuntimeError(
                 f"cannot redispatch candidate in status {candidate_record.status}"
             )
+        if candidate_record.allocation_eligibility != "eligible":
+            raise RuntimeError(
+                f"cannot redispatch retired candidate {candidate_id}"
+            )
 
         selected_worker_agent_type = (
             worker_agent_type
@@ -1406,6 +1672,10 @@ class FileSearchRuntime:
 
             candidate_record = self._load_candidate_record(run_id, candidate_id)
             workspace = candidate_record.task.workspace
+            if candidate_record.allocation_eligibility != "eligible":
+                raise RuntimeError(
+                    f"cannot start session for retired candidate {candidate_id}"
+                )
 
             if worker_budget_override is not None:
                 worker_budget_override = self._normalize_worker_budget_override(
@@ -1631,6 +1901,10 @@ class FileSearchRuntime:
             raise RuntimeError(
                 f"cannot continue candidate in status {candidate_record.status}"
             )
+        if candidate_record.allocation_eligibility != "eligible":
+            raise RuntimeError(
+                f"cannot continue retired candidate {candidate_record.candidate_id}"
+            )
 
         worker_budget_override = self._normalize_worker_budget_override(
             worker_host=session.host,
@@ -1738,6 +2012,7 @@ class FileSearchRuntime:
             "objective": frozen.spec.objective,
             "metric_name": frozen.spec.metric_name,
             "metric_direction": frozen.spec.metric_direction,
+            "orchestration_mode": frozen.spec.strategy.orchestration_mode,
             "run_budget": frozen.spec.budget.model_dump(mode="json"),
             "candidate_task": candidate_record.task.model_dump(mode="json"),
             "results_tsv": str(results_tsv),
@@ -2064,6 +2339,14 @@ class FileSearchRuntime:
             raise RuntimeError(
                 f"cannot verify candidate in status {record.status}"
             )
+        if (
+            scope == "process"
+            and agent_session_id is not None
+            and record.allocation_eligibility != "eligible"
+        ):
+            raise RuntimeError(
+                f"candidate {candidate_id} was retired by adaptive allocation"
+            )
         if scope == "promotion":
             if agent_session_id is not None:
                 raise PermissionError(
@@ -2260,6 +2543,15 @@ class FileSearchRuntime:
                 record,
                 frozen.spec.metric_direction,
             )
+            previous_best_score = (
+                prior_best.score
+                if prior_best is not None
+                else (
+                    record.task.expansion_source.score
+                    if record.task.expansion_source is not None
+                    else None
+                )
+            )
             iteration_number = len(record.iterations) + 1
             failure_class = next(
                 (
@@ -2450,7 +2742,7 @@ class FileSearchRuntime:
             )
             disposition = self._iteration_disposition(
                 iteration,
-                prior_best,
+                previous_best_score,
                 frozen.spec.metric_direction,
             )
             iteration.disposition = disposition
@@ -2461,7 +2753,10 @@ class FileSearchRuntime:
                 target = (
                     prior_best.git_head
                     if prior_best is not None
-                    else pre_attempt_settled_head
+                    else (
+                        record.task.workspace_base_revision
+                        or pre_attempt_settled_head
+                    )
                 )
                 if target is None:
                     raise RuntimeError("candidate rollback has no restoration target")
@@ -2488,6 +2783,15 @@ class FileSearchRuntime:
                 and settled.artifact_hash != best_iteration.artifact_hash
             ):
                 raise RuntimeError("candidate artifact does not match its best iteration")
+            if (
+                best_iteration is None
+                and record.task.expansion_source is not None
+                and settled.artifact_hash
+                != record.task.expansion_source.artifact_hash
+            ):
+                raise RuntimeError(
+                    "derived candidate artifact does not match its initial incumbent"
+                )
             self._apply_candidate_artifact_state(record, settled)
 
             ledger_entry = ResultLedgerEntry(
@@ -2509,7 +2813,37 @@ class FileSearchRuntime:
             )
             iteration.ledger_git_head = ledger_git_head
             iteration.workspace_git_head_after_settlement = ledger_git_head
+            allocation_decision: AllocationDecision | None = None
+            adaptive_spec = frozen.spec.strategy.adaptive_search
+            if adaptive_spec is not None:
+                reward = evaluate_reward(
+                    adaptive_spec,
+                    RewardContext(
+                        candidate_id=candidate_id,
+                        iteration=iteration_number,
+                        commit=attempt.git_head or "no-commit",
+                        process_passed=bool(report.process_passed),
+                        disposition=disposition,
+                        attempt_score=report.aggregate_score,
+                        previous_best_score=previous_best_score,
+                        metric_direction=frozen.spec.metric_direction,
+                        created_at=created_at,
+                    ),
+                )
+                iteration.reward_evaluation = reward
             record.iterations.append(iteration)
+            if adaptive_spec is not None and agent_session_id is not None:
+                try:
+                    allocation_decision = self._create_allocation_decision_locked(
+                        run,
+                        frozen,
+                        record,
+                        iteration,
+                    )
+                except Exception as exc:
+                    iteration.allocation_decision_error = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
             if pending_tool_copies:
                 consumed = {item.receipt_id for item in pending_tool_copies}
                 record.pending_tool_copies = [
@@ -2537,6 +2871,8 @@ class FileSearchRuntime:
                     "shared_tool_deduplicated_entries": iteration.shared_tool_deduplicated_entries,
                     "toolization_decision": iteration.toolization_decision,
                     "toolization_advisories": iteration.toolization_advisories,
+                    "reward_evaluation": iteration.reward_evaluation,
+                    "allocation_decision": allocation_decision,
                 }
             )
             record.status = "evaluated"
@@ -2548,17 +2884,6 @@ class FileSearchRuntime:
                 record.promotion_report = None
                 record.promotion_evidence = None
             self._write_candidate_record(run_id, record)
-            if agent_session_id is not None:
-                try:
-                    self._create_evidence_annotation_task(
-                        run_id,
-                        frozen,
-                        candidate_id,
-                        iteration,
-                    )
-                except Exception:
-                    # Explanatory Views never invalidate settled verifier Evidence.
-                    pass
 
             if self._update_best_seen(run, frozen.spec, report):
                 if best_iteration is None:
@@ -3192,6 +3517,8 @@ class FileSearchRuntime:
                 "strategy.config cannot contain worker lease fields "
                 f"{', '.join(misplaced)}; place them in strategy.worker_budget"
             )
+        if strategy.adaptive_search is not None:
+            validate_adaptive_search_spec(strategy.adaptive_search)
 
     def _validate_worker_launch_for_host(self, strategy: StrategySpec) -> None:
         self._validate_worker_launch_options_for_host(
@@ -3611,6 +3938,9 @@ class FileSearchRuntime:
         plan: SearchPlan,
         proposal: CandidateProposal,
         slot: int,
+        *,
+        expansion_source: ExpansionSource | None = None,
+        source_record: CandidateRecord | None = None,
     ) -> CandidateTask:
         workspace = self._run_dir(run.run_id) / "workspace" / candidate_id
 
@@ -3621,6 +3951,11 @@ class FileSearchRuntime:
             workspace=workspace,
             run_id=run.run_id,
             candidate_id=candidate_id,
+            base_revision=(
+                expansion_source.settled_commit
+                if expansion_source is not None
+                else None
+            ),
         )
 
         instructions = [
@@ -3639,6 +3974,14 @@ class FileSearchRuntime:
             "规划另一个变体前，检查 workspace/results.tsv 中继承的 iteration 日志。运行时拥有并提交这份仅追加账本，会验证已有记录未被修改，并为每份返回的 verifier 报告添加且只添加一条记录；绝不能重写、截断、删除或手动追加它。",
             "按 context.supplemental_evaluation_enabled 和 Evidence 的 supplemental_available 标记按需读取一次 search_get_evidence_detail；补充评价不参与结算。仅在当前 Git 能解析该 commit 且代码证据必要时用 git diff HEAD <commit> -- <allowed-file> 做只读比较；不要访问或 fetch peer workspace，也不要 checkout/reset peer commit。",
         ]
+        if expansion_source is not None:
+            instructions.extend(
+                [
+                    "这是 adaptive_search 从已验证父 Evidence 派生的新 candidate。",
+                    "把 expansion_source 视为当前 candidate 的初始 incumbent；刷新 Global Evidence 后自主选择下一项假设，不依赖父 worker transcript。",
+                    "若 verifier 返回 allocation_decision，立即完成 handoff 并返回主流程，不再启动新的 iteration。",
+                ]
+            )
         share_out_dir = None
         if frozen.spec.shared_dir.enabled:
             SharedDirManager(self._run_dir(run.run_id)).ensure_layout()
@@ -3660,16 +4003,44 @@ class FileSearchRuntime:
         instructions.extend(proposal.instructions)
 
         hypothesis = proposal.hypothesis or proposal.intent or f"候选 {candidate_id}"
-        selected_model = self._selected_model_for_slot(plan, slot)
+        selected_model = (
+            source_record.task.selected_model
+            if source_record is not None
+            else self._selected_model_for_slot(plan, slot)
+        )
         return CandidateTask(
             run_id=run.run_id,
             candidate_id=candidate_id,
+            parent_id=(
+                expansion_source.candidate_id
+                if expansion_source is not None
+                else None
+            ),
+            parent_candidate_ids=(
+                [
+                    *source_record.task.parent_candidate_ids,
+                    source_record.candidate_id,
+                ]
+                if source_record is not None
+                else []
+            ),
+            base_candidate_id=(
+                expansion_source.candidate_id
+                if expansion_source is not None
+                else None
+            ),
             plan_id=plan.plan_id,
             hypothesis=hypothesis,
             workspace=workspace,
             workspace_backend=materialization.backend,
             workspace_branch=materialization.branch,
             workspace_base_revision=materialization.base_revision,
+            allocation_depth=(
+                source_record.task.allocation_depth + 1
+                if source_record is not None
+                else 0
+            ),
+            expansion_source=expansion_source,
             share_out_dir=share_out_dir,
             allowed_files=frozen.spec.edit_surface.allow,
             denied_files=frozen.spec.edit_surface.deny,
@@ -3692,6 +4063,16 @@ class FileSearchRuntime:
                 "workspace_backend": materialization.backend,
                 "workspace_branch": materialization.branch,
                 "workspace_base_revision": materialization.base_revision,
+                "allocation_depth": (
+                    source_record.task.allocation_depth + 1
+                    if source_record is not None
+                    else 0
+                ),
+                "allocation_source_candidate_id": (
+                    expansion_source.candidate_id
+                    if expansion_source is not None
+                    else None
+                ),
             },
         )
 
@@ -3917,6 +4298,28 @@ class FileSearchRuntime:
             frozen.spec.metric_name,
         )
         return self._candidate_results_ledger(source_record)
+
+    def _source_ledger_at_revision(
+        self,
+        source_record: CandidateRecord,
+        settled_commit: str,
+    ) -> list[ResultLedgerEntry]:
+        entries = self._candidate_results_ledger(source_record)
+        matching_index = next(
+            (
+                index
+                for index, entry in enumerate(entries)
+                if entry.ledger_git_head == settled_commit
+            ),
+            None,
+        )
+        if matching_index is None:
+            if source_record.results_ledger_git_head != settled_commit:
+                raise RuntimeError(
+                    "expansion source ledger revision is not present in candidate history"
+                )
+            matching_index = len(entries) - 1
+        return [entry.model_copy(deep=True) for entry in entries[: matching_index + 1]]
 
     def _render_results_tsv(
         self,
@@ -4739,22 +5142,22 @@ class FileSearchRuntime:
     def _iteration_disposition(
         cls,
         iteration: IterationRecord,
-        prior_best: IterationRecord | None,
+        prior_best_score: float | None,
         metric_direction: Literal["maximize", "minimize"],
     ) -> IterationDisposition:
         if not cls._git_iteration_eligible(iteration):
             return "failure"
-        if prior_best is None:
+        if prior_best_score is None:
             return "keep"
-        assert iteration.score is not None and prior_best.score is not None
+        assert iteration.score is not None
         improved = (
-            iteration.score > prior_best.score
+            iteration.score > prior_best_score
             if metric_direction == "maximize"
-            else iteration.score < prior_best.score
+            else iteration.score < prior_best_score
         )
         if improved:
             return "keep"
-        if iteration.score == prior_best.score:
+        if iteration.score == prior_best_score:
             return "retain"
         return "discard"
 
@@ -6765,6 +7168,11 @@ class FileSearchRuntime:
 
     def _kick_evidence_annotator(self, run_id: str) -> None:
         try:
+            self._ensure_evidence_annotation_tasks(run_id)
+        except Exception:
+            # Annotation registration never changes settled verifier Evidence.
+            pass
+        try:
             from goal_plus.evidence_annotator import kick_evidence_annotator
 
             kick_evidence_annotator(self.root_dir, run_id)
@@ -6772,8 +7180,70 @@ class FileSearchRuntime:
             # Evidence settlement and reads never depend on explanatory Views.
             return
 
+    def _ensure_evidence_annotation_tasks(self, run_id: str) -> None:
+        """Idempotently register missing View tasks from settled Evidence."""
+        with self._run_transaction(run_id):
+            if not self._evidence_annotation_run_active(run_id):
+                return
+            run = self._load_run(run_id)
+            frozen = self._load_frozen_spec(run.frozen_spec_id)
+            for record in self._load_candidate_records(run_id):
+                for iteration in record.iterations:
+                    if iteration.agent_session_id is None:
+                        continue
+                    try:
+                        if self._load_evidence_annotation_task(
+                            run_id,
+                            record.candidate_id,
+                            iteration.iteration,
+                        ) is not None:
+                            continue
+                        self._create_evidence_annotation_task(
+                            run_id,
+                            frozen,
+                            record.candidate_id,
+                            iteration,
+                        )
+                    except Exception:
+                        # A later verifier settlement or Evidence read retries it.
+                        continue
+
     def _plan_dir(self, run_id: str) -> Path:
         return self._run_dir(run_id) / "plans"
+
+    def _allocation_decision_dir(self, run_id: str) -> Path:
+        return self._run_dir(run_id) / "allocation-decisions"
+
+    def _load_allocation_decision(
+        self,
+        run_id: str,
+        decision_id: str,
+    ) -> AllocationDecision:
+        path = self._allocation_decision_dir(run_id) / f"{decision_id}.json"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"allocation decision not found: {decision_id} in run {run_id}"
+            )
+        return AllocationDecision.model_validate(load_json(path))
+
+    def _load_allocation_decisions(
+        self,
+        run_id: str,
+    ) -> list[AllocationDecision]:
+        directory = self._allocation_decision_dir(run_id)
+        if not directory.exists():
+            return []
+        return [
+            AllocationDecision.model_validate(load_json(path))
+            for path in sorted(directory.glob("allocation_*.json"))
+        ]
+
+    def _write_allocation_decision(self, decision: AllocationDecision) -> None:
+        write_json(
+            self._allocation_decision_dir(decision.run_id)
+            / f"{decision.decision_id}.json",
+            decision.model_dump(mode="json"),
+        )
 
     def _agent_session_dir(self, run_id: str) -> Path:
         return self._run_dir(run_id) / "agent_sessions"

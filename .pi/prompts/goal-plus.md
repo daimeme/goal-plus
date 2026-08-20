@@ -12,9 +12,10 @@
 $ARGUMENTS
 
 当此 Pi prompt 开启 Search Mode 时，SearchSpec strategy 必须设置
-`worker_host: "pi-rpc"` 和 `orchestration_mode: "parallel_loops"`，SearchSpec 必须显式
-设置 `workspace.backend="git_worktree"`，使 worker
-通过持久化 Pi pool 以一组固定的初始自主候选循环运行。
+`worker_host: "pi-rpc"`；默认设置 `orchestration_mode: "parallel_loops"`。只有原始目标或
+benchmark 明确要求 runtime reward/allocation 时，才按 skill 中的隔离配置使用
+`orchestration_mode: "adaptive_search"` 和 `budget.max_candidates`。SearchSpec 必须显式
+设置 `workspace.backend="git_worktree"`，使 worker 通过持久化 Pi pool 运行。
 只有用户明确要求兼容隔离时才能设置 `workspace.backend="copy"`。
 
 冻结前，要求每个 `ranking_signal` 输出一个最终 JSON 对象，其中包含有限数值类型的
@@ -33,7 +34,7 @@ verifier 必须保持候选工作区只读，并使用唯一的 `GOAL_PLUS_VERIF
 `upgrade_spec`；只有实际目标发生变化时才使用 `revise_goal`。新搜索方向或特性迁移应留在
 当前 run 内。这是现有流程中的推理，不是新的运行时阶段或审批步骤。
 
-如果 worker 报告 verifier 问题，在核查其证据期间暂停继续执行。`parallel_loops` 模式下
+如果 worker 报告 verifier 问题，在核查其证据期间暂停继续执行。普通 `parallel_loops` 模式下
 不存在常规 slot 补充。不要因为诊断稀疏、分数低或进展缓慢而重建。
 如果主 agent 确认确有契约、覆盖范围、确定性、目标或基础设施缺陷，先调用
 `search_invalidate_run`，中断整个 Pi pool 并等待 `active_count=0`，然后修复并重新冻结，

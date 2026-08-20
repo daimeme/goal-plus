@@ -104,10 +104,11 @@ A1B3，数量之和必须等于
 
 `origin="initial"` 和 `origin="in_progress"` 仅表示 provenance，遵循相同的自主准入规则。
 
-调用 `search_freeze_spec` 前，确保 SearchSpec strategy 设置
-`worker_host: "pi-rpc"` 和 `orchestration_mode: "parallel_loops"`。Pi Search Mode
-必须通过 Pi RPC driver 运行一组固定的初始自主候选循环。不能省略这些字段；旧运行时默认值
-不能表达该 policy。
+调用 `search_freeze_spec` 前，确保 SearchSpec strategy 设置 `worker_host: "pi-rpc"`。
+默认使用 `orchestration_mode: "parallel_loops"`，通过 Pi RPC driver 运行一组固定的初始自主
+候选循环。只有目标或 benchmark 明确要求 runtime reward/allocation 时才使用下文定义的
+`orchestration_mode: "adaptive_search"`。不能省略 orchestration mode；旧运行时默认值不能
+表达该 policy。
 
 新 SearchSpec 还必须显式设置 `workspace.backend="git_worktree"`，使候选共享 Git object
 database，并能解析 Global Evidence 中的 peer commit。只有用户明确要求兼容隔离时才能设置
@@ -128,6 +129,18 @@ Pi 支持的 strategy name 仅限以下可移植内置子集：
 candidate/subagent 数。
 每个初始候选工作区都是长期自主循环，不创建后续规划轮次或基于质量的替代项。
 
+`adaptive_search` 第一版使用 `budget.max_parallel` 作为所有 pool 合计的 live worker 上限，并
+要求显式设置 `budget.max_candidates` 作为整个 run 的唯一 candidate 上限。配置组件固定为
+`reward={name: metric_progress, version: 1}`、
+`allocation={name: low_reward_replace, version: 1}` 和
+`expansion={source_policy: highest_value, model_policy: inherit_source, max_depth: ...}`。
+runtime 在 verifier 结算后隔离计算 reward，并持久化 retire/expand decision；Pi supervisor
+不计算 reward、不选择 candidate，也不自动 refill。
+decision 对外可见前，触发 iteration 的 Git/results ledger 已结算。annotation task 注册与
+reward/allocation 互不作为前置条件，缺失 task 会从已持久化 iteration 幂等补齐。
+retirement 只禁止该 candidate 的下一轮 iteration；结束 Pi worker 不会取消 annotator 或删除
+Global Evidence。View 仍异步生成，期间允许 `view=null`，主流程不等待或轮询。
+
 用户或外层 harness 提供 wall-clock、attempt 或 token 预算时：
 
 1. 为主 agent 最终验证、选择、报告和提升预留时间。
@@ -140,8 +153,8 @@ candidate/subagent 数。
    提前关闭时间。
 
 subagent 负责其候选工作区内的瓶颈分析、假设选择、特性迁移、结构重启和 rebase 决策。
-主 agent 绝不发送偏好的技术方向。低分、一次没有改进的迭代或其他候选领先，
-都不是停止或替换条件。
+主 agent 绝不发送偏好的技术方向。普通 `parallel_loops` 中，低分、一次没有改进的迭代或
+其他候选领先都不是停止或替换条件；`adaptive_search` 只认 runtime 返回的 decision。
 
 遵循 `raw_goal` 中的探索模式末行。`probe` 模式下，全局 policy 可以在可行性、潜力和阻塞
 因素已经可信时停止。`autonomous` 模式下，只要还有外层时间，就为每个 active 候选提供
@@ -189,7 +202,10 @@ subagent 负责其候选工作区内的瓶颈分析、假设选择、特性迁�
       链接到同一个 `goal_plus_id`。
    绝不能选择或提升已失效的 run。其产物、限定范围的问题和特性仍可作为研究输入，
    但每个旧分数都只是历史，每个导入特性都必须在后继契约下重新验证。
-8. 每个 `candidate_ready` 验证后，只执行全局停止 policy。如果 policy 为 false，使用能适应
+8. 每个 `candidate_ready` 验证后，先检查 durable verifier 报告。只有当前 FrozenSpec 显式设置
+   `orchestration_mode="adaptive_search"` 时，才调用
+   `search_list_allocation_decisions(status="pending")`；普通 `parallel_loops` 禁止调用 allocation
+   decision 工具，只执行全局停止 policy。如果 policy 为 false，使用能适应
    剩余时间的预算，对该准确 `candidate_id` 调用 `pi_search_pool_continue`。不要把
    `timed_out`、`interrupted` 或 `failed` 当作 candidate-ready continuation。运行时提供以下
    固定中性 continuation prompt：
@@ -207,6 +223,16 @@ subagent 负责其候选工作区内的瓶颈分析、假设选择、特性迁�
    改变 continuation。
    主 Pi 轮次中断后，使用 `pi_search_pool_snapshot(run_id=...)` 重新发现 pool；
    后续准确 snapshot 使用 `pool_id`。
+   `adaptive_search` 中如果准确 iteration 已关联 allocation decision，不得 continue 被退休的
+   candidate。对该 decision 调用一次幂等的 `search_apply_allocation_decision`；只执行返回内容，
+   不自行改写剪枝、来源、模型或预算。apply 会从固定的 verifier-backed source commit 物化
+   workspace，继承 results ledger、run-global Evidence 可见性和 selected model，并创建 native
+   session provenance。统计所有已记录 pool 的 active jobs；仅当合计低于 `max_parallel` 时，
+   对返回的新 candidate 调用新的
+   `pi_search_pool_open(candidate_ids=[new_candidate_id], max_parallel=1, final_verify=true)`。
+   保存每个新 `pool_id` 并同等 wait/snapshot/close。不得恢复已退休 candidate，也不得增加
+   手动 pool submit 工具或让 supervisor 自动补位。reward/policy 错误保持 fail-open，只记录
+   iteration；`search_select` 始终按硬 verifier score，而不是 reward。
 9. 正常选择前等待准确 snapshot 的 `active_count=0`，再调用
    `pi_search_pool_close(mode="drain")`。只有 run 已按第 7 步失效时，主 agent 才对仍有
    active job 的 pool 使用 `mode="interrupt"`。运行时会拒绝在真实 closeout reserve 之外

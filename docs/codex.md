@@ -99,7 +99,7 @@ The catalog is a discovery surface; dispatch still obeys the current
 `spawn_agent` schema and reports a launch error if that schema cannot accept a
 chosen model override.
 
-The parent then:
+For normal `parallel_loops`, the parent then:
 
 1. freezes `strategy.orchestration_mode="parallel_loops"`, plans once, and
    launches all initial candidates;
@@ -118,6 +118,14 @@ hypothesis/pivot/rebase, edits its workspace, and verifies with a one-line
 description of the realized attempt. A `null` View never blocks it. It must not
 create candidates, select, report, promote, or mutate Goal Plus state. Main
 never replaces it because of low score or one non-improving completion.
+
+An explicitly frozen `adaptive_search` run keeps the same initial steps but may
+return a runtime-owned `allocation_decision` after verifier settlement. Main
+does not continue the retired worker: it idempotently applies that decision,
+maps the returned derived-session launch payload to `spawn_agent`, and keeps
+the live count within `max_parallel`. The child starts from the decision's
+verifier-backed Git settlement and inherited run Evidence/model provenance.
+Reward does not affect final hard-score selection.
 
 ## Worker Deadline
 

@@ -22,6 +22,7 @@ let activeGoalPlusId = process.env.GOAL_PLUS_ID;
 let cachedGoalStatus: GoalPlusStatusPayload | undefined;
 let continuationCount = 0;
 let workerContinuationCount = 0;
+let workerAllocationDecisionId: string | undefined;
 let activeGoalStartedAt: string | undefined;
 let activeGoalStartEntryCount = 0;
 
@@ -101,6 +102,7 @@ const SearchBudget = Type.Object(
 			description:
 				"一个 Search run 初始创建并实际并行工作的候选 Agent 数量；后续继续已有 candidate/session。",
 		}),
+		max_candidates: Type.Optional(NullablePositiveInteger),
 		max_tokens: Type.Optional(NullablePositiveInteger),
 	},
 	{ additionalProperties: false },
@@ -112,6 +114,36 @@ const WorkerBudget = Type.Object(
 		on_exceed: Type.Optional(Type.Literal("interrupt")),
 		min_runtime_seconds: Type.Optional(NullablePositiveInteger),
 		min_verifier_runs: Type.Optional(NullablePositiveInteger),
+	},
+	{ additionalProperties: false },
+);
+const AdaptiveSearchSpec = Type.Object(
+	{
+		reward: Type.Optional(Type.Object(
+			{
+				name: Type.Optional(Type.Literal("metric_progress")),
+				version: Type.Optional(Type.Literal(1)),
+				params: Type.Optional(LooseObject),
+			},
+			{ additionalProperties: false },
+		)),
+		allocation: Type.Optional(Type.Object(
+			{
+				name: Type.Optional(Type.Literal("low_reward_replace")),
+				version: Type.Optional(Type.Literal(1)),
+				params: Type.Optional(LooseObject),
+			},
+			{ additionalProperties: false },
+		)),
+		expansion: Type.Optional(Type.Object(
+			{
+				source_policy: Type.Optional(Type.Literal("highest_value")),
+				model_policy: Type.Optional(Type.Literal("inherit_source")),
+				max_depth: Type.Optional(PositiveInteger),
+				worker_budget: Type.Optional(Type.Union([WorkerBudget, Type.Null()])),
+			},
+			{ additionalProperties: false },
+		)),
 	},
 	{ additionalProperties: false },
 );
@@ -168,13 +200,17 @@ const ModelSpec = Type.Object(
 const StrategySpec = Type.Object(
 	{
 		name: Type.Optional(Type.String({ minLength: 1 })),
-		orchestration_mode: Type.Optional(Type.Literal("parallel_loops")),
+		orchestration_mode: Type.Optional(Type.Union([
+			Type.Literal("parallel_loops"),
+			Type.Literal("adaptive_search"),
+		])),
 		worker_host: Type.Optional(Type.Literal("pi-rpc")),
 		worker_agent_type: Type.Optional(NullableString),
 		worker_budget: Type.Optional(Type.Union([WorkerBudget, Type.Null()])),
 		worker_launch: Type.Optional(Type.Union([WorkerLaunch, Type.Null()])),
 		evidence_annotator: Type.Optional(EvidenceAnnotator),
 		models: Type.Optional(Type.Array(ModelSpec)),
+		adaptive_search: Type.Optional(Type.Union([AdaptiveSearchSpec, Type.Null()])),
 		config: Type.Optional(LooseObject),
 	},
 	{ additionalProperties: false },
@@ -526,6 +562,23 @@ const RuntimeToolSchemas: Record<string, TSchema> = {
 		},
 		{ additionalProperties: false },
 	),
+	search_list_allocation_decisions: Type.Object(
+		{
+			run_id: Type.String(),
+			status: Type.Optional(Type.Union([
+				Type.Literal("pending"),
+				Type.Literal("applied"),
+			])),
+		},
+		{ additionalProperties: false },
+	),
+	search_apply_allocation_decision: Type.Object(
+		{
+			run_id: Type.String(),
+			decision_id: Type.String(),
+		},
+		{ additionalProperties: false },
+	),
 	search_select: Type.Object(
 		{ run_id: Type.String() },
 		{ additionalProperties: false },
@@ -586,9 +639,9 @@ const RuntimeToolSchemas: Record<string, TSchema> = {
 };
 const RuntimeToolDescriptions: Record<string, string> = {
 	goal_plus_save_spec_draft:
-		"保存发现的 SearchSpec draft。新的 Pi spec 使用 orchestration_mode=parallel_loops，以 max_parallel 作为初始 candidate/subagent 数。",
+		"保存发现的 SearchSpec draft。新的 Pi spec 默认使用 orchestration_mode=parallel_loops；明确需要 runtime reward/allocation 时可使用 adaptive_search，并以 max_candidates 限制唯一 candidate 总数。",
 	search_freeze_spec:
-		"冻结不可变的 SearchSpec 和 verifier bundle。预检使用一次性源码副本，并拒绝 verifier 工作区副作用；并发 Search 下 verifier 临时文件必须放入唯一的 GOAL_PLUS_VERIFIER_TMPDIR/TMPDIR，绝不能使用固定 /tmp 路径。parallel_loops 模式由一份初始 plan 创建长期候选。",
+		"冻结不可变的 SearchSpec 和 verifier bundle。预检使用一次性源码副本，并拒绝 verifier 工作区副作用；并发 Search 下 verifier 临时文件必须放入唯一的 GOAL_PLUS_VERIFIER_TMPDIR/TMPDIR，绝不能使用固定 /tmp 路径。parallel_loops 与 adaptive_search 都只创建一份初始 plan；后者要求 Git worktree 和 max_candidates。",
 	search_create:
 		"从 frozen_spec_id 创建 Search run。初始 run 必须省略 source_run_id，或在 strict schema 下传 null；仅在已有真实前驱时传入准确的 run_* ID，绝不能传 initial 或 in_progress。",
 	search_get_agent_context:
@@ -603,6 +656,10 @@ const RuntimeToolDescriptions: Record<string, string> = {
 		"按需展开一条已结算 Evidence 的 supplemental evaluation。仅当 agent context 声明该能力开启且目标行 supplemental_available=true 时调用；independent 模式只允许读取自己的 candidate。",
 	search_run_verifier:
 		"为一个候选评分。worker process verifier 必须提供一句话 hypothesis，并在 shared_dir 启用时提交 toolization_decision：staged 至少包含一个正向 signal 和实际 tool_names；not_applicable 必须给出具体 exclusion，不能只写不复用。runtime 以 staging inventory 和 publication settlement 为权威，只把 toolization_review_missing、toolization_stage_missing 或 toolization_decision_mismatch 记录为 monitor/report advisory；它们不改变结算、硬 score、选择或 promotion。工具化目标仅是降低同一 run 内 peer 重建诊断流程的成本，不要求跨项目通用。每份报告都会在运行时拥有、继承而来的 workspace/results.tsv 中追加且只追加一条已验证记录，并提交该文件。process verifier 返回 keep/retain/discard/failure disposition；严格改善为 keep，同分为 retain 并成为 candidate-local 最新基线，只有退化或验证失败时恢复此前硬分最佳。开放式补充评价和动态 peer 比较不改变结算、硬 score 或最终 PASS/FAIL。带 candidate_action=stop_and_report 的 VerifierWorkspaceSideEffect 属于基础设施失败：worker 必须停止，不能清理或重试，使父级能够修复并重新冻结。",
+	search_list_allocation_decisions:
+		"仅当当前 FrozenSpec 显式设置 orchestration_mode=adaptive_search 时，只读列出其持久化 allocation decisions；不启动、停止或继续 host worker。",
+	search_apply_allocation_decision:
+		"仅当当前 FrozenSpec 显式设置 orchestration_mode=adaptive_search 且 runtime 已返回准确 decision 时，幂等应用其剪枝与派生：保留 Evidence，物化派生 workspace，并创建 native session provenance。Pi 主 agent 只在可用执行配额内启动返回的 candidate。",
 	search_invalidate_run:
 		"主 agent 确认 verifier 契约、覆盖范围、确定性、目标对齐或基础设施失败后，原子地隔离该 run。随后中断每个 host worker，等待 active worker 数归零，修复并重新冻结，再使用 source_run_id 创建后继项。",
 	search_report:
@@ -1287,6 +1344,12 @@ function registerRuntimeTool(pi: ExtensionAPI, name: string) {
 				workspaceRoot = details?.workspace;
 				sawContext = true;
 			}
+			if (role === "worker" && name === "search_run_verifier" && isRecord(result.details)) {
+				const decision = result.details.allocation_decision;
+				if (isRecord(decision) && typeof decision.decision_id === "string") {
+					workerAllocationDecisionId = decision.decision_id;
+				}
+			}
 			return result;
 		},
 	});
@@ -1474,6 +1537,8 @@ export default function (pi: ExtensionAPI) {
 		"search_start_batch",
 		"search_get_agent_observability",
 		"search_run_verifier",
+		"search_list_allocation_decisions",
+		"search_apply_allocation_decision",
 		"search_select",
 		"search_report",
 		"search_promote",
@@ -1567,6 +1632,7 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.hasPendingMessages()) return;
 		if (role === "worker") {
 			if (lengthWithoutToolCall) return;
+			if (workerAllocationDecisionId) return;
 			if (
 				!Number.isFinite(workerContinueUntilMs) ||
 				workerContinueUntilMs <= 0 ||

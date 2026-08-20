@@ -81,9 +81,10 @@ Codex 可能显示带客户端特定前缀的 MCP 工具；按最后的逻辑工
    它不能改变已准备好的 search draft 是否可以继续。
 9. 调用 `search_freeze_spec` 等 Search Mode 工具前，调用
    `goal_plus_gate(event="pre_tool_use", context={"tool_name": "search_freeze_spec"})`。
-10. 在 Search Mode 中使用内部 `search` skill：以
-    `strategy.orchestration_mode="parallel_loops"` 冻结新的 Codex spec，
-    只创建一次初始候选集合，然后验证并恢复这些相同的候选 worker；依次使用
+10. 在 Search Mode 中使用内部 `search` skill：默认以
+    `strategy.orchestration_mode="parallel_loops"` 冻结新的 Codex spec；只有目标或 benchmark
+    明确要求 runtime reward/allocation 时才使用内部 skill 定义的 `adaptive_search` 配置。
+    两种模式都只做一次初始规划；`adaptive_search` 后续只执行 runtime 持久化的派生决策。依次使用
     `search_freeze_spec`、`search_create`、`search_plan_next`、
     `search_start_batch`、`search_start_agent_session`、最终
     `search_run_verifier`、`search_select` 和 `search_promote`。
@@ -179,9 +180,10 @@ PostTool 事件还会执行一次只读 verifier 时间提示检查；它们绝�
 和耗时审计，直到主 agent 记录终态。
 `SubagentStop` 感知所有权：Search 候选只会被阻止到其自己的
 `search_run_verifier(..., agent_session_id=...)` 调用被持久记录为止。它返回后，
-父 agent 执行完成验证，观察是否出现新的 verifier 支持的全局最佳，并在全局停止 policy
-为 false 时恢复同一个候选 worker。父 agent 不选择其下一个技术方向，也不创建基于质量的
-替代项。普通 subagent 不继承父级 action；最终检查审查员保留其独立审查 gate。
+父 agent 执行完成验证，观察是否出现新的 verifier 支持的全局最佳。普通
+`parallel_loops` 在全局停止 policy 为 false 时恢复同一个候选 worker，父 agent 不选择其
+下一个技术方向，也不创建基于质量的替代项。显式 `adaptive_search` 只执行 runtime 已持久化的
+allocation decision。普通 subagent 不继承父级 action；最终检查审查员保留其独立审查 gate。
 
 即使 hook 是强制后备，也应保留上述显式工作流调用作为可审计状态转换。subagent 工具事件
 不会绑定 Goal Plus 所有权。`goal_plus_gate` 不监管 worker 生命周期；Codex worker 预算和

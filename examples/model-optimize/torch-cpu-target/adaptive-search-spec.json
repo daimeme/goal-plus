@@ -1,0 +1,104 @@
+{
+  "objective": "maximize single-core PyTorch tokens_per_second while preserving the deterministic workload checksum",
+  "metric_name": "tokens_per_second",
+  "metric_direction": "maximize",
+  "source_path": "examples/model-optimize/torch-cpu-target",
+  "workspace": {
+    "backend": "git_worktree"
+  },
+  "edit_surface": {
+    "allow": [
+      "model.py",
+      "serving.py"
+    ],
+    "deny": [
+      "benchmark.py",
+      "verify.py",
+      "single_thread.py",
+      "workload.json",
+      "cpp_reference/**"
+    ]
+  },
+  "process_verifiers": [
+    {
+      "name": "torch_cpu_correctness",
+      "role": "validity_gate",
+      "command": [
+        "python",
+        "verify.py"
+      ],
+      "timeout_seconds": 60,
+      "resource_lock": "torch-cpu-adaptive-search"
+    },
+    {
+      "name": "torch_cpu_tokens_per_second",
+      "role": "ranking_signal",
+      "command": [
+        "python",
+        "benchmark.py"
+      ],
+      "timeout_seconds": 120,
+      "resource_lock": "torch-cpu-adaptive-search"
+    }
+  ],
+  "promotion_verifiers": [
+    {
+      "name": "torch_cpu_correctness",
+      "role": "promotion_gate",
+      "command": [
+        "python",
+        "verify.py"
+      ],
+      "timeout_seconds": 60,
+      "resource_lock": "torch-cpu-adaptive-search"
+    }
+  ],
+  "budget": {
+    "max_parallel": 2,
+    "max_candidates": 4
+  },
+  "strategy": {
+    "name": "random",
+    "orchestration_mode": "adaptive_search",
+    "worker_host": "codex",
+    "worker_budget": {
+      "max_runtime_seconds": 360,
+      "on_exceed": "interrupt"
+    },
+    "adaptive_search": {
+      "reward": {
+        "name": "metric_progress",
+        "version": 1,
+        "params": {
+          "score_scale": 1000.0,
+          "failure_reward": -1.0
+        }
+      },
+      "allocation": {
+        "name": "low_reward_replace",
+        "version": 1,
+        "params": {
+          "min_iterations": 2,
+          "consecutive_below": 2,
+          "reward_threshold": 0.0
+        }
+      },
+      "expansion": {
+        "source_policy": "highest_value",
+        "model_policy": "inherit_source",
+        "max_depth": 2,
+        "worker_budget": {
+          "max_runtime_seconds": 300,
+          "on_exceed": "interrupt"
+        }
+      }
+    },
+    "config": {
+      "seed": 20260819
+    }
+  },
+  "constraints": {
+    "suggested_batch_size": 2,
+    "task_summary": "Optimize only model.py or serving.py. Keep PyTorch, OpenMP, MKL, and build thread counts at one. Use runtime reward/allocation decisions exactly; retired candidates must not start another iteration."
+  }
+}

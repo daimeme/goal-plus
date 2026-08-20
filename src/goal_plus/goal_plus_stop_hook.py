@@ -693,9 +693,27 @@ def _autoresearch_lease_stop_context(
     min_verifier_runs = int(evidence.get("min_verifier_runs") or 1)
     remaining_seconds = max(0.0, min_runtime_seconds - elapsed_seconds)
     infrastructure_stop = _candidate_requires_immediate_stop(search_root, session)
+    candidate_path = (
+        search_root
+        / "runs"
+        / session.run_id
+        / "candidates"
+        / session.candidate_id
+        / "candidate.json"
+    )
+    allocation_stop = False
+    try:
+        candidate_payload = json.loads(candidate_path.read_text(encoding="utf-8"))
+        allocation_stop = (
+            isinstance(candidate_payload, dict)
+            and candidate_payload.get("allocation_eligibility") == "retired"
+            and bool(candidate_payload.get("retired_by_decision_id"))
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        pass
     verifier_complete = verifier_runs >= min_verifier_runs
     runtime_complete = remaining_seconds <= 0
-    completion_complete = infrastructure_stop or (
+    completion_complete = infrastructure_stop or allocation_stop or (
         verifier_complete and runtime_complete
     )
 
@@ -737,6 +755,8 @@ def _autoresearch_lease_stop_context(
                 "release_reason": (
                     "infrastructure_stop_and_report"
                     if infrastructure_stop
+                    else "allocation_decision"
+                    if allocation_stop
                     else "lease_satisfied"
                 ),
             }
@@ -781,6 +801,7 @@ def _autoresearch_lease_stop_context(
         "search_candidate_remaining_seconds": remaining_seconds,
         "search_candidate_required_verifier_runs": min_verifier_runs,
         "search_candidate_infrastructure_stop": infrastructure_stop,
+        "search_candidate_allocation_stop": allocation_stop,
     }
 
 

@@ -54,7 +54,21 @@ class Budget(SearchModel):
             "parallel_loops 只创建这一组长期候选，后续继续已有 candidate/session。"
         ),
     )
+    max_candidates: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "一个 run 最多可物化的唯一 candidate 数量。"
+            "parallel_loops 未设置时等同于 max_parallel；adaptive_search 必须显式设置。"
+        ),
+    )
     max_tokens: int | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def candidate_limit_covers_parallel_width(self) -> "Budget":
+        if self.max_candidates is not None and self.max_candidates < self.max_parallel:
+            raise ValueError("budget.max_candidates must be >= budget.max_parallel")
+        return self
 
 
 WorkspaceBackend = Literal["copy", "git_worktree"]
@@ -490,9 +504,36 @@ class EvidenceAnnotationTask(SearchModel):
     updated_at: str
 
 
+class RewardEvaluatorSpec(SearchModel):
+    name: str = Field(default="metric_progress", min_length=1)
+    version: int = Field(default=1, ge=1)
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class AllocationPolicySpec(SearchModel):
+    name: str = Field(default="low_reward_replace", min_length=1)
+    version: int = Field(default=1, ge=1)
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExpansionPolicySpec(SearchModel):
+    source_policy: Literal["highest_value"] = "highest_value"
+    model_policy: Literal["inherit_source"] = "inherit_source"
+    max_depth: int = Field(default=3, ge=1, le=64)
+    worker_budget: WorkerBudget | None = None
+
+
+class AdaptiveSearchSpec(SearchModel):
+    reward: RewardEvaluatorSpec = Field(default_factory=RewardEvaluatorSpec)
+    allocation: AllocationPolicySpec = Field(default_factory=AllocationPolicySpec)
+    expansion: ExpansionPolicySpec = Field(default_factory=ExpansionPolicySpec)
+
+
 class StrategySpec(SearchModel):
     name: str = "agent_guided"
-    orchestration_mode: Literal["rolling_candidates", "parallel_loops"] = (
+    orchestration_mode: Literal[
+        "rolling_candidates", "parallel_loops", "adaptive_search"
+    ] = (
         "parallel_loops"
     )
     worker_host: AgentHostKind = "codex"
@@ -505,6 +546,10 @@ class StrategySpec(SearchModel):
     models: list[ModelSpec] = Field(
         default_factory=list,
         exclude_if=lambda value: not value,
+    )
+    adaptive_search: AdaptiveSearchSpec | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
     )
     config: dict[str, Any] = Field(default_factory=dict)
 
@@ -521,6 +566,19 @@ class StrategySpec(SearchModel):
         if value is not None and not value.strip():
             raise ValueError("worker_agent_type must be non-empty when provided")
         return value
+
+    @model_validator(mode="after")
+    def adaptive_config_matches_orchestration_mode(self) -> "StrategySpec":
+        if self.orchestration_mode == "adaptive_search":
+            if self.adaptive_search is None:
+                raise ValueError(
+                    "strategy.adaptive_search is required for adaptive_search mode"
+                )
+        elif self.adaptive_search is not None:
+            raise ValueError(
+                "strategy.adaptive_search requires orchestration_mode=adaptive_search"
+            )
+        return self
 
 
 class VerifierCommand(SearchModel):
@@ -588,6 +646,16 @@ class SearchSpec(SearchModel):
         if not value.strip():
             raise ValueError("source_path must be non-empty")
         return value
+
+    @model_validator(mode="after")
+    def adaptive_search_requires_branchable_budget(self) -> "SearchSpec":
+        if self.strategy.orchestration_mode != "adaptive_search":
+            return self
+        if self.workspace.backend != "git_worktree":
+            raise ValueError("adaptive_search requires workspace.backend=git_worktree")
+        if self.budget.max_candidates is None:
+            raise ValueError("adaptive_search requires budget.max_candidates")
+        return self
 
 
 class SearchSpecDraft(SearchModel):
@@ -813,6 +881,91 @@ class SharedToolRecord(SearchModel):
         return payload
 
 
+RewardEvaluationStatus = Literal["evaluated", "ineligible", "error"]
+AllocationEligibility = Literal["eligible", "retired"]
+AllocationDecisionStatus = Literal["pending", "applied"]
+
+
+class RewardEvaluation(SearchModel):
+    reward_id: str = Field(min_length=1)
+    evaluator_name: str = Field(min_length=1)
+    evaluator_version: int = Field(ge=1)
+    config_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    status: RewardEvaluationStatus
+    reward: float | None = Field(default=None, allow_inf_nan=False)
+    state_value: float | None = Field(default=None, allow_inf_nan=False)
+    components: dict[str, float] = Field(default_factory=dict)
+    error: str | None = None
+    created_at: str
+
+    @field_validator("components")
+    @classmethod
+    def components_must_be_finite(
+        cls, value: dict[str, float]
+    ) -> dict[str, float]:
+        import math
+
+        if any(not math.isfinite(item) for item in value.values()):
+            raise ValueError("reward components must be finite")
+        return value
+
+    @model_validator(mode="after")
+    def status_matches_payload(self) -> "RewardEvaluation":
+        if self.status == "evaluated" and self.reward is None:
+            raise ValueError("evaluated reward requires a reward value")
+        if self.status == "error" and not self.error:
+            raise ValueError("reward error status requires an error message")
+        return self
+
+
+class ExpansionSource(SearchModel):
+    candidate_id: str = Field(min_length=1)
+    iteration: int = Field(ge=1)
+    evidence_commit: str = Field(min_length=1)
+    settled_commit: str = Field(min_length=1)
+    artifact_hash: str = Field(min_length=1)
+    score: float = Field(allow_inf_nan=False)
+    reward_id: str = Field(min_length=1)
+    state_value: float = Field(allow_inf_nan=False)
+
+
+class AllocationAction(SearchModel):
+    action_id: str = Field(min_length=1)
+    kind: Literal["continue_candidate", "retire_candidate", "expand_candidate"]
+    candidate_id: str | None = None
+    source: ExpansionSource | None = None
+    new_candidate_id: str | None = None
+    worker_budget: WorkerBudget | None = None
+    reason: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def action_fields_match_kind(self) -> "AllocationAction":
+        if self.kind in {"continue_candidate", "retire_candidate"}:
+            if self.candidate_id is None:
+                raise ValueError(f"{self.kind} requires candidate_id")
+            if self.source is not None or self.new_candidate_id is not None:
+                raise ValueError(f"{self.kind} cannot declare an expansion source")
+        elif self.source is None or self.new_candidate_id is None:
+            raise ValueError("expand_candidate requires source and new_candidate_id")
+        return self
+
+
+class AllocationDecision(SearchModel):
+    decision_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    trigger_candidate_id: str = Field(min_length=1)
+    trigger_iteration: int = Field(ge=1)
+    trigger_commit: str = Field(min_length=1)
+    trigger_reward_id: str = Field(min_length=1)
+    policy_name: str = Field(min_length=1)
+    policy_version: int = Field(ge=1)
+    config_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    actions: list[AllocationAction] = Field(min_length=1)
+    status: AllocationDecisionStatus = "pending"
+    created_at: str
+    applied_at: str | None = None
+
+
 class CandidateTask(SearchModel):
     run_id: str
     candidate_id: str
@@ -825,6 +978,11 @@ class CandidateTask(SearchModel):
     workspace_backend: WorkspaceBackend = "copy"
     workspace_branch: str | None = None
     workspace_base_revision: str | None = None
+    allocation_depth: int = Field(default=0, ge=0)
+    expansion_source: ExpansionSource | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     share_out_dir: Path | None = None
     allowed_files: list[str]
     denied_files: list[str]
@@ -981,6 +1139,14 @@ class ScoreReport(SearchModel):
         default_factory=list,
         exclude_if=lambda value: not value,
     )
+    reward_evaluation: RewardEvaluation | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    allocation_decision: AllocationDecision | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
 
 class PromotionEvidence(SearchModel):
@@ -1020,6 +1186,18 @@ class IterationRecord(SearchModel):
     metrics: dict[str, Any] = Field(default_factory=dict)
     log_paths: list[str] = Field(default_factory=list)
     disposition: IterationDisposition | None = None
+    reward_evaluation: RewardEvaluation | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    allocation_decision_id: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    allocation_decision_error: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     restored_to_iteration: int | None = Field(default=None, ge=1)
     restored_to_git_head: str | None = None
     workspace_git_head_after_settlement: str | None = None
@@ -1114,6 +1292,7 @@ class RunRecord(SearchModel):
     next_candidate_index: int = 1
     next_plan_index: int = 1
     next_agent_session_index: int = 1
+    next_allocation_decision_index: int = 1
     candidates_total: int = 0
     candidates_evaluated: int = 0
     best_candidate_id: str | None = None
@@ -1141,6 +1320,11 @@ class CandidateRecord(SearchModel):
     candidate_id: str
     status: Literal["created", "evaluated", "failed"]
     task: CandidateTask
+    allocation_eligibility: AllocationEligibility = "eligible"
+    retired_by_decision_id: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     detected_changed_files: list[str] = Field(default_factory=list)
     touched_denied_files: bool = False
     changed_outside_allowed: bool = False

@@ -58,6 +58,7 @@ def test_codex_goal_plus_skill_records_modes_and_mcp_tools() -> None:
         "开放式补充评价发生在每次 Evidence 结算之后",
         "也不改变硬",
         "candidate-local 结算",
+        "明确要求 runtime reward/allocation 时才使用",
     ):
         assert expected in text
     assert "mode_hint" not in text
@@ -186,6 +187,35 @@ def test_codex_search_skill_documents_parallel_loop_policy() -> None:
     assert "deepen_incumbent" not in text
     assert "transfer_feature" not in text
     assert "macro_restart" not in text
+
+
+def test_codex_assets_document_runtime_owned_adaptive_allocation() -> None:
+    skill = (ROOT / ".codex" / "skills" / "search" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    worker = (ROOT / ".codex" / "agents" / "search_candidate_agent.toml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "## Adaptive Search 契约" in skill
+    assert "只有 FrozenSpec 显式设置以下配置时" in skill
+    assert "orchestration_mode: adaptive_search" in skill
+    assert "budget.max_candidates" in skill
+    assert "search_list_allocation_decisions" in skill
+    assert "search_apply_allocation_decision" in skill
+    assert "spawn_agent" in skill
+    assert "reward 只用于 allocation" in skill
+    assert "annotation task" in skill
+    assert "互不依赖的结算后分支" in skill
+    assert "缺失 task 会从已持久化 iteration 幂等补齐" in skill
+    assert "只 fence 下一轮 candidate iteration" in skill
+    assert "allocation_decision" in worker
+    assert '`context.orchestration_mode == "adaptive_search"`' in worker
+    assert "并且 `search_run_verifier` 明确返回非空" in worker
+    assert "独立持久化" in worker
+    assert "worker 不自行计算 reward" in worker
+    assert "异步 View 会在" in worker
+    assert "进入 Global Evidence" in worker
 
 
 def test_codex_search_skill_documents_worker_budget_watchdog() -> None:

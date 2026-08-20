@@ -80,9 +80,17 @@ Codex and Pi both satisfy asynchronous wait-any semantics:
   global stop condition is true. Pi reloads the same native session in a new
   process.
 
-New Pi/Codex specs set `orchestration_mode="parallel_loops"`; one initial round
+New Pi/Codex specs normally set `orchestration_mode="parallel_loops"`; one initial round
 creates the durable candidate loops. Neither adapter turns that round into a
 completion barrier. Low score or no improvement never causes replacement.
+
+With an explicitly frozen `adaptive_search` spec, replacement is still not an
+adapter decision. The runtime calculates reward after verifier settlement,
+persists the allocation action, fences the retired candidate, and returns a
+derived native launch payload when main applies that action. Codex maps the
+payload to `spawn_agent`. Pi main opens a new one-candidate managed pool only
+after checking the aggregate live count across its recorded pools. Pi exposes
+no manual pool-submit API, and its supervisor never plans or auto-refills.
 
 ## Worker Budgets
 
@@ -91,9 +99,10 @@ completion barrier. Low score or no improvement never causes replacement.
 | Codex | `worker_budget.max_runtime_seconds` | initial wait, one closeout message, final wait, interrupt |
 | Pi RPC | `worker_budget.max_runtime_seconds` | closeout steer plus hard process watchdog |
 
-`max_turns` is only a prompt hint for Codex and Pi. `max_parallel` uniquely
-sets the initial candidate/live-worker count because later work continues the
-same candidates.
+`max_turns` is only a prompt hint for Codex and Pi. `max_parallel` sets the
+initial width and live-worker ceiling. Ordinary runs continue the same candidates;
+adaptive runs additionally cap total materialized candidates with
+`max_candidates`.
 
 Codex supports a lower-bound single-worker AutoResearch lease through
 `worker_budget.min_runtime_seconds` and `min_verifier_runs`. Its

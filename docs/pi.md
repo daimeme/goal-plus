@@ -172,6 +172,15 @@ There is no public synchronous candidate/batch runner. Pool open owns the
 initial fixed lane set; pool continue owns later dispatches for those same
 lanes.
 
+For an explicitly frozen `adaptive_search` run, the runtime may retire a lane
+and return a persisted expansion decision. This releases any lower-bound lease
+for that retired lane. Main applies the exact decision, checks aggregate active
+jobs across all known pools, and opens a new one-candidate pool with
+`max_parallel=1` for the returned candidate only when a slot is available.
+There is still no public pool-submit tool and the supervisor never chooses or
+auto-refills candidates. `budget.max_candidates` limits total materialized
+candidates; final selection still uses the hard verifier metric.
+
 ## Worker Boundary
 
 Worker-role extension tools are limited to `search_get_agent_context`,

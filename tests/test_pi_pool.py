@@ -420,6 +420,74 @@ def test_pi_pool_worker_publishes_candidate_ready_after_driver_completion(
     ]
 
 
+def test_pi_pool_allocation_decision_releases_unsatisfied_minimum_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _make_project(tmp_path)
+    runtime = FileSearchRuntime(tmp_path / ".search")
+    frozen = runtime.freeze_spec(
+        _pi_rpc_spec_with_budget(project, max_parallel=1),
+        [project / "evaluator.py"],
+    )
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    candidate_id = _planned_candidates(runtime, run_id, 1)[0]
+    monkeypatch.setattr(pi_pool, "_launch_pool_job", lambda **_kwargs: os.getpid())
+    opened = open_pi_search_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[candidate_id],
+        worker_budgets={
+            candidate_id: {
+                "min_runtime_seconds": 10,
+                "min_verifier_runs": 3,
+                "max_runtime_seconds": 20,
+                "on_exceed": "interrupt",
+            }
+        },
+    )
+    submitted = opened["submitted"][0]
+    now = [0.0]
+
+    def fake_driver(**_request: Any) -> dict[str, Any]:
+        now[0] += 1
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "candidate_id": candidate_id,
+            "agent_session_id": "agent_retired",
+            "bound_session": {"counters": {"verifier_runs": 1}},
+            "steps": [],
+            "final_score_report": {
+                "aggregate_score": 1.0,
+                "process_passed": True,
+                "allocation_decision": {"decision_id": "allocation_0001"},
+            },
+        }
+
+    monkeypatch.setattr(pi_pool.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(pi_pool, "run_pi_search_candidate", fake_driver)
+
+    assert run_pool_worker(
+        root_dir=runtime.root_dir,
+        pool_id=opened["pool_id"],
+        job_id=submitted["job_id"],
+    ) == 0
+    waited = wait_any_pi_search_pool(
+        root_dir=runtime.root_dir,
+        pool_id=opened["pool_id"],
+        timeout_seconds=0,
+    )
+    [event] = waited["events"]
+    assert event["kind"] == "candidate_ready"
+    assert event["result"]["lease"]["satisfied"] is False
+    assert event["result"]["lease"]["release_reason"] == "allocation_decision"
+    assert event["result"]["lease"]["allocation_decision_id"] == (
+        "allocation_0001"
+    )
+    assert event["result"]["lease"]["dispatch_count"] == 1
+
+
 def test_pi_pool_worker_continues_same_session_until_cumulative_lease(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -39,6 +39,8 @@ def test_create_mcp_registers_search_runtime_tools(tmp_path: Path) -> None:
         "search_get_agent_observability",
         "search_run_verifier",
         "search_list_iterations",
+        "search_list_allocation_decisions",
+        "search_apply_allocation_decision",
         "search_select",
         "search_report",
         "search_promote",

@@ -242,6 +242,23 @@ class SearchTools:
     ) -> list[dict[str, Any]]:
         return self.runtime.list_iterations(run_id, candidate_id)
 
+    def search_list_allocation_decisions(
+        self,
+        run_id: str,
+        status: Literal["pending", "applied"] | None = None,
+    ) -> list[dict[str, Any]]:
+        return [
+            item.model_dump(mode="json")
+            for item in self.runtime.list_allocation_decisions(run_id, status)
+        ]
+
+    def search_apply_allocation_decision(
+        self,
+        run_id: str,
+        decision_id: str,
+    ) -> dict[str, Any]:
+        return self.runtime.apply_allocation_decision(run_id, decision_id)
+
     def search_select(self, run_id: str) -> dict[str, Any]:
         return self.runtime.select(run_id)
 

@@ -43,6 +43,9 @@ def test_pi_goal_plus_prompt_starts_with_create_call() -> None:
     assert 'worker_host: "pi-rpc"' in text
     assert 'worker_mode: "agent-session-pool"' not in text
     assert 'orchestration_mode: "parallel_loops"' in text
+    assert "只有原始目标或" in text
+    assert "明确要求 runtime reward/allocation 时" in text
+    assert 'orchestration_mode: "adaptive_search"' in text
     assert '`workspace.backend="git_worktree"`' in text
     assert '有限数值类型的' in text
     assert '`spec.metric_name`' in text
@@ -183,6 +186,47 @@ def test_pi_goal_plus_skill_documents_parallel_loop_policy() -> None:
     assert "deepen_incumbent" not in text
     assert "transfer_feature" not in text
     assert "macro_restart" not in text
+
+
+def test_pi_assets_document_runtime_owned_adaptive_allocation() -> None:
+    skill = (ROOT / ".pi" / "skills" / "goal-plus" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    worker = (ROOT / ".pi" / "prompts" / "search-candidate-worker.md").read_text(
+        encoding="utf-8"
+    )
+    extension = (ROOT / ".pi" / "extensions" / "goal-plus.ts").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'orchestration_mode: "adaptive_search"' in skill
+    assert "只有目标或 benchmark 明确要求 runtime reward/allocation 时才使用" in skill
+    assert "budget.max_candidates" in skill
+    assert "search_list_allocation_decisions" in skill
+    assert "search_apply_allocation_decision" in skill
+    assert "手动 pool submit" in skill
+    assert "annotation task" in skill
+    assert "互不作为前置条件" in skill
+    assert "缺失 task 会从已持久化 iteration 幂等补齐" in skill
+    assert "只禁止该 candidate 的下一轮 iteration" in skill
+    assert "普通 `parallel_loops` 禁止调用 allocation" in skill
+    assert "allocation_decision" in worker
+    assert '`context.orchestration_mode == "adaptive_search"`' in worker
+    assert "独立持久化" in worker
+    assert "异步 View 会在 worker 结束后继续生成" in worker
+    assert 'Type.Literal("adaptive_search")' in extension
+    assert "max_candidates: Type.Optional" in extension
+    assert "const AdaptiveSearchSpec" in extension
+    assert "search_list_allocation_decisions: Type.Object" in extension
+    assert "search_apply_allocation_decision: Type.Object" in extension
+    assert "仅当当前 FrozenSpec 显式设置 orchestration_mode=adaptive_search" in extension
+    assert "runtime 已返回准确 decision" in extension
+    assert "workerAllocationDecisionId" in extension
+    assert 'name === "search_run_verifier"' in extension
+    main_tools = extension.split("const mainTools = [", 1)[1].split("];", 1)[0]
+    assert '"search_list_allocation_decisions"' in main_tools
+    assert '"search_apply_allocation_decision"' in main_tools
+    assert "pi_search_pool_submit" not in extension
 
 
 def test_pi_worker_prompt_requires_runtime_context_and_verifier() -> None:

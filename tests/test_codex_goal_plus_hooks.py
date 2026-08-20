@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from goal_plus.goal_plus import EXPLORATION_MODE_LINES, FileGoalPlusRuntime
+from goal_plus.goal_plus_stop_hook import _autoresearch_lease_stop_context
 from goal_plus.models import SearchSpec
 from goal_plus.monitor import goal_plus_monitor_snapshot
 from goal_plus.runtime import FileSearchRuntime
@@ -964,3 +965,42 @@ def test_stop_for_terminal_goal_emits_non_llm_stats(tmp_path: Path) -> None:
     assert "phase=intake" in message
     assert "search_tasks=0" in message
     assert "stop=1" in message
+def test_search_candidate_allocation_retires_active_autoresearch_lease(
+    tmp_path: Path,
+) -> None:
+    runtime, run_id, candidate_id, agent_session_id = _codex_search_worker(
+        tmp_path,
+        worker_budget={
+            "min_runtime_seconds": 300,
+            "min_verifier_runs": 2,
+            "max_runtime_seconds": 420,
+            "on_exceed": "interrupt",
+        },
+    )
+    candidate = runtime._load_candidate_record(run_id, candidate_id).model_copy(
+        update={
+            "allocation_eligibility": "retired",
+            "retired_by_decision_id": "allocation_0001",
+        }
+    )
+    runtime._write_candidate_record(run_id, candidate)
+    session = runtime._load_agent_session_by_id(agent_session_id)
+
+    context = _autoresearch_lease_stop_context(
+        runtime.root_dir,
+        session,
+        verifier_runs=1,
+    )
+
+    assert context is not None
+    assert context["search_candidate_completion_complete"] is True
+    assert context["search_candidate_allocation_stop"] is True
+    lease_path = (
+        runtime.root_dir
+        / "host-logs"
+        / "codex-autoresearch-leases"
+        / f"{agent_session_id}.json"
+    )
+    lease = json.loads(lease_path.read_text(encoding="utf-8"))
+    assert lease["status"] == "released"
+    assert lease["release_reason"] == "allocation_decision"

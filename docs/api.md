@@ -37,6 +37,8 @@ goal can retain multiple search tasks.
 | `search_invalidate_run` | atomically fence a run after main-confirmed verifier inadequacy |
 | `search_list_history` | rank candidates and return current-run feature/verifier research rollups |
 | `search_list_iterations` | inspect every verifier iteration for one candidate |
+| `search_list_allocation_decisions` | read pending/applied adaptive allocation decisions without controlling workers |
+| `search_apply_allocation_decision` | idempotently apply runtime-owned retire/expand actions and return derived launch payloads |
 | `goal_plus_monitor_snapshot` | read combined goal/run/session/host evidence without controlling workers |
 
 ### Initial candidate allocation
@@ -46,7 +48,7 @@ goal can retain multiple search tasks.
 | `search_plan_next` | persist the one initial candidate allocation |
 | `search_start_batch` | materialize that plan's isolated candidate workspaces |
 
-New Pi/Codex specs use `strategy.orchestration_mode="parallel_loops"`.
+New Pi/Codex specs normally use `strategy.orchestration_mode="parallel_loops"`.
 `search_plan_next(requested_k)` may be called exactly once; later work resumes
 the existing candidates. It plans:
 
@@ -56,6 +58,26 @@ min(requested_k, remaining max_parallel)
 
 The standard flow passes `requested_k=budget.max_parallel` for that one planning
 call. `budget.max_parallel` is the single initial candidate/live-worker count.
+
+An explicitly configured `adaptive_search` run still has one initial plan, but
+may replace a retired lane through persisted runtime decisions. It requires a
+Git worktree and `budget.max_candidates`. The v1 registered components are
+`metric_progress/v1` and `low_reward_replace/v1`; their params are isolated
+under `strategy.adaptive_search`. A verifier report may include
+`reward_evaluation` and `allocation_decision`. The main agent applies the exact
+decision and launches the returned session payload; it does not author a
+replacement. Reward never replaces the hard metric used by `search_select`.
+Before a decision becomes visible, its triggering iteration has completed Git
+and results-ledger settlement. Annotation task registration and reward/allocation
+are independent post-settlement branches: failure in either branch does not block
+the other, and missing annotation tasks are idempotently recovered from durable
+iterations on later verifier settlements or Global Evidence reads. Retirement
+fences only the candidate's next iteration: it neither cancels View generation
+nor removes the settled result from Global Evidence. The task or View may
+temporarily be absent and is projected as `view=null`.
+Hidden-answer QA benchmarks must not use this feedback path: gold-derived
+correctness, reward, or allocation is an answer oracle. Keep only public format
+validation worker-visible and score all final answers externally.
 
 `search_invalidate_run` requires a typed verifier reason, non-empty summary,
 and concrete evidence. It changes the run to `aborted` and blocks new planning,
@@ -98,7 +120,7 @@ feature ledger, and scoped pitfalls. It marks predecessor scores non-reusable.
 | `search_redispatch_candidate` | main | create a fresh session in the same candidate workspace |
 | `search_bind_agent_handle` | main/host driver | attach a Codex or Pi native handle |
 | `search_continue_agent_session` | main | return native same-worker continuation fields when supported |
-| `search_get_agent_context` | candidate worker | load authoritative ids, workspace, candidate-local iterations/results, and resume data |
+| `search_get_agent_context` | candidate worker | load authoritative ids, workspace, orchestration mode, candidate-local iterations/results, and resume data |
 | `search_get_global_evidence` | candidate worker | project settled worker attempts in the current run as score, disposition, exact attempt commit, and a possibly delayed objective View |
 | `search_stage_shared_tool` | candidate worker | copy explicit sources from the caller's `.tmp/tool-drafts/` into bounded `.tmp/share-out` staging; this does not publish them |
 | `search_copy_shared_tool` | candidate worker | copy a Tool View-bound shared-dir snapshot into the caller's local inbox for reversible verification |
@@ -111,7 +133,9 @@ launch, continuation, or redispatch without mutating the frozen spec. Pi pool
 minimum fields are cumulative across the internal native-session resumes of one
 pool job; ordinary overrides remain dispatch-scoped.
 
-`search_get_agent_context` exposes `supplemental_evaluation_enabled`. When it is
+`search_get_agent_context` exposes the frozen `orchestration_mode` so worker
+prompt branches can distinguish ordinary `parallel_loops` from explicitly enabled
+`adaptive_search`. It also exposes `supplemental_evaluation_enabled`. When it is
 false, workers do not wait for or request supplemental evaluation. When enabled,
 `search_get_global_evidence` adds only `supplemental_available=true`; full summary,
 dimensions, peer comparisons, and limitations are
@@ -273,7 +297,12 @@ goal-plus-pi-tool goal_plus_monitor_snapshot \
 | `process_verifiers` | correctness gates |
 | `ranking_signals` | metric-producing commands |
 | `promotion_verifiers` | checks required before promotion |
-| `budget.max_parallel` | single initial candidate/live-worker count |
+| `budget.max_parallel` | initial width and live-worker ceiling |
+| `budget.max_candidates` | optional total unique candidate ceiling; required by `adaptive_search` |
+| `strategy.orchestration_mode` | `parallel_loops` or explicitly configured `adaptive_search` |
+| `strategy.adaptive_search.reward` | registered reward evaluator name/version/params |
+| `strategy.adaptive_search.allocation` | registered allocation policy name/version/params |
+| `strategy.adaptive_search.expansion` | source/model policy, depth cap, and optional derived-worker budget |
 | `strategy.worker_host` | maintained execution host: `pi-rpc` or `codex` |
 | `strategy.worker_budget` | host-enforced upper bound and optional minimum lease |
 | `workspace.backend` | `git_worktree` (default) or `copy` |

@@ -2227,6 +2227,7 @@ def test_get_agent_context_has_only_authoritative_worker_fields(tmp_path: Path) 
     ):
         assert forbidden not in context, f"get_agent_context must not return {forbidden}"
     assert context["candidate_task"]["candidate_id"] == tasks[0].candidate_id
+    assert context["orchestration_mode"] == "parallel_loops"
     assert "history" not in context
     assert "iterations" in context
 

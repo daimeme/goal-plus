@@ -1352,6 +1352,13 @@ def _report_iteration_payload(
         "failure_class": iteration.failure_class,
         "git_head": iteration.git_head,
         "disposition": iteration.disposition,
+        "reward_evaluation": (
+            iteration.reward_evaluation.model_dump(mode="json")
+            if iteration.reward_evaluation is not None
+            else None
+        ),
+        "allocation_decision_id": iteration.allocation_decision_id,
+        "allocation_decision_error": iteration.allocation_decision_error,
         "restored_to_iteration": iteration.restored_to_iteration,
         "restored_to_git_head": iteration.restored_to_git_head,
         "workspace_git_head_after_settlement": (
@@ -1442,6 +1449,14 @@ def _task_details(
                 "parent_id": candidate.task.parent_id,
                 "parent_candidate_ids": candidate.task.parent_candidate_ids,
                 "base_candidate_id": candidate.task.base_candidate_id,
+                "allocation_depth": candidate.task.allocation_depth,
+                "allocation_eligibility": candidate.allocation_eligibility,
+                "retired_by_decision_id": candidate.retired_by_decision_id,
+                "expansion_source": (
+                    candidate.task.expansion_source.model_dump(mode="json")
+                    if candidate.task.expansion_source is not None
+                    else None
+                ),
                 "hypothesis": candidate.task.hypothesis,
                 "selected_model": (
                     candidate.task.selected_model.model
@@ -1664,6 +1679,12 @@ def _task_details(
         }
         for plan in plans
     ]
+    allocation_decisions = [
+        load_json(path)
+        for path in sorted(
+            (run_dir / "allocation-decisions").glob("allocation_*.json")
+        )
+    ]
     return {
         **task_summary,
         "is_report_run": run_id == report_run_id,
@@ -1679,6 +1700,7 @@ def _task_details(
             "budget": frozen.spec.budget.model_dump(mode="json", exclude_none=True),
         },
         "plans": plan_payloads,
+        "allocation_decisions": allocation_decisions,
         "candidates": candidate_payloads,
         "sessions": session_payloads,
     }
@@ -3678,6 +3700,14 @@ def _render_shared_evidence_view(task: dict[str, Any]) -> str:
                 f"<strong>{_html(score)}</strong>"
                 f'<div class="evidence-score-kind">{_html(item.get("score_kind"))}</div>'
             )
+        reward = item.get("reward_evaluation")
+        reward_copy = "Not observed"
+        if isinstance(reward, dict):
+            reward_copy = _number(reward.get("reward"), digits=3)
+            if item.get("allocation_decision_id"):
+                reward_copy += f" | {_text(item.get('allocation_decision_id'))}"
+            elif item.get("allocation_decision_error"):
+                reward_copy += " | policy error"
         rows.append(
             f'<tr class="{escape(" ".join(row_classes), quote=True)}"'
             " data-evidence-row"
@@ -3688,6 +3718,7 @@ def _render_shared_evidence_view(task: dict[str, Any]) -> str:
             f'<td class="mono"><strong>{_html(candidate_id)}</strong></td>'
             f'<td class="mono">{_html(item.get("iteration"))}</td>'
             f'<td class="mono">{score_copy}</td>'
+            f'<td class="mono">{_html(reward_copy)}</td>'
             f"<td>{_status(disposition)}</td>"
             f'<td><div class="evidence-copy">{_html(attempt)}</div></td>'
             f'<td>{view_copy}{view_error}{monitor_copy}<div class="evidence-view-meta">{_status(view_state)}</div></td>'
@@ -3722,7 +3753,7 @@ def _render_shared_evidence_view(task: dict[str, Any]) -> str:
         "</div></div>"
         '<div class="table-scroll evidence-view-scroll">'
         '<table class="evidence-view-table"><thead><tr>'
-        "<th>Time</th><th>Candidate</th><th>Iteration</th><th>Score</th>"
+        "<th>Time</th><th>Candidate</th><th>Iteration</th><th>Score</th><th>Reward / allocation</th>"
         "<th>Settlement</th><th>Worker attempt</th><th>Objective View</th>"
         "<th>Toolization Review</th><th>Published Tool View</th>"
         "<th>Tool Adoption Summary</th><th>Revision</th>"
@@ -3750,6 +3781,9 @@ def _render_candidates(task: dict[str, Any]) -> str:
             f'<tr class="{"selected-row" if candidate.get("selected") else ""}">'
             f'<td class="mono"><strong>{_html(candidate.get("candidate_id"))}</strong></td>'
             f'<td>{_status("selected" if candidate.get("selected") else candidate.get("status"))}</td>'
+            f'<td>{_status(candidate.get("allocation_eligibility") or "eligible")}</td>'
+            f'<td class="mono">{_html(candidate.get("allocation_depth"))}</td>'
+            f'<td class="mono">{_html((candidate.get("expansion_source") or {}).get("candidate_id"))}</td>'
             f'<td class="mono">{_html(_number(candidate.get("score")))}</td>'
             f'<td class="mono">{_html(_number(candidate.get("best_score")))}</td>'
             f'<td>{_html(candidate.get("process_passed"))}</td>'
@@ -3761,7 +3795,7 @@ def _render_candidates(task: dict[str, Any]) -> str:
         )
     return (
         '<div class="table-scroll"><table><thead><tr>'
-        "<th>Candidate</th><th>Status</th><th>Final score</th><th>Best score</th>"
+        "<th>Candidate</th><th>Status</th><th>Allocation</th><th>Depth</th><th>Source</th><th>Final score</th><th>Best score</th>"
         "<th>Process pass</th><th>Iterations</th><th>Sessions</th><th>Changed files</th><th>Hypothesis</th>"
         f'</tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
     )

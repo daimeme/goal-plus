@@ -116,6 +116,45 @@ worker，再冻结修正后的 spec，创建 successor run。旧分数不能跨�
 全部写数量时按数量展开。每个 selected model 随 candidate 和原生 session 的续跑保持
 不变，但所有 lane 仍共享同一份 Global Evidence。
 
+### Adaptive Search 第一版
+
+`strategy.orchestration_mode="adaptive_search"` 保留同一条主流程，只在 verifier settlement
+之后增加两个隔离步骤：注册的 `RewardEvaluator` 计算 `RewardEvaluation`，注册的
+`AllocationPolicy` 根据已持久化 reward/state 决定是否产生 `AllocationDecision`。第一版提供
+`metric_progress/v1` 和 `low_reward_replace/v1`；未知 name/version 在 freeze 时拒绝。
+
+该模式要求 `workspace.backend="git_worktree"`、`budget.max_parallel` 和显式
+`budget.max_candidates`。前者仍是 live-worker 上限，后者是 run 内可物化的唯一 candidate
+上限。reward 错误和 policy 错误 fail-open：错误随 iteration 保存，但不改变硬 score、
+keep/retain/discard/failure、`best.json`、selection 或 promotion。
+
+Reward/allocation 与 Evidence annotation 是两个独立的结算后分支，互不作为前置条件。
+annotation task 写入或启动失败不会阻止 reward、retirement 或 expansion decision；reward evaluator
+或 allocation policy 失败也不会阻止 annotation task 注册。Runtime 会在后续 worker verifier
+结算和 Global Evidence 读取时，根据已持久化 iteration 幂等补齐缺失 task。
+
+低 reward policy 只检查触发 candidate 的连续低 reward。命中后，runtime 原子持久化
+`retire_candidate + expand_candidate` actions，立即 fence 被退休 candidate，并把派生来源固定到
+最高 `state_value` 的 verifier-backed Evidence、settled Git commit 和模型 provenance。
+decision 对外可见前，触发它的 iteration 已完成 Git/results ledger 结算。retirement 只禁止该
+candidate 进入下一轮 iteration，不会删除其 Evidence、取消 annotator 或把它排除出 Global
+Evidence；annotation task 即使在 retirement 后补注册，客观 View 仍会异步生成并绑定到同一条
+Evidence。与普通 iteration 一样，task 尚未注册或 View 生成期间都可暂时显示 `view=null`，调用方
+不轮询。
+`search_apply_allocation_decision` 幂等物化子 workspace、继承父 results ledger 与 run-global
+Evidence 可见性、创建 `AgentSessionRecord`，然后返回 host-native launch payload。runtime 不启动、
+等待或中断 worker；Codex/Pi 主 agent 只执行 decision，host supervisor 不计算 reward、选择来源或
+自动 refill。
+
+持久化路径为 `.gp/runs/<run_id>/allocation-decisions/*.json`，reward 同时保存在对应
+`IterationRecord`。第一版没有价值回传、UCB、搜索宽度调整、探索配额或多候选原子 allocation；
+这些能力以后可以在同一 evaluator/policy/action 接口上扩展。
+
+该模式只适用于可以合法向 worker 暴露硬 metric 的优化任务。隐藏答案 benchmark 不能把
+gold correctness、score、reward 或由它们派生的 allocation decision 暴露给 worker；这类任务
+继续使用公开格式 verifier、预声明的 gold-independent 聚合规则和所有答案固定后的外部评分，
+不能启用 verifier-guided `adaptive_search`。
+
 ## Candidate 循环
 
 每个 candidate iteration 只需要以下协议：
@@ -145,9 +184,10 @@ candidate 可以同时读取同一版 Evidence 并并发工作。
 不改变 score、verifier disposition、selection 或 promotion。实际 staging inventory 与现有
 publication settlement 始终是权威。
 
-main agent 不向 worker 提供后续技术方向。正常路径优先续跑同一个原生 session；
+main agent 不向 worker 提供后续技术方向。普通 `parallel_loops` 正常路径优先续跑同一个原生 session；
 redispatch 只用于恢复，并继续使用同一个 candidate 工作区、Git 历史、verifier 历史
-和有界 handoff。
+和有界 handoff。`adaptive_search` 只有在 verifier 返回 runtime 已持久化的 allocation decision
+时才停止该 candidate；worker 和 host 都不能自行推断质量剪枝。
 
 ## Global Evidence
 
