@@ -516,6 +516,12 @@ class AllocationPolicySpec(SearchModel):
     params: dict[str, Any] = Field(default_factory=dict)
 
 
+class ValueBackupOperatorSpec(SearchModel):
+    name: str = Field(default="identity", min_length=1)
+    version: int = Field(default=1, ge=1)
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
 class ExpansionPolicySpec(SearchModel):
     source_policy: Literal["highest_value"] = "highest_value"
     model_policy: Literal["inherit_source"] = "inherit_source"
@@ -525,6 +531,9 @@ class ExpansionPolicySpec(SearchModel):
 
 class AdaptiveSearchSpec(SearchModel):
     reward: RewardEvaluatorSpec = Field(default_factory=RewardEvaluatorSpec)
+    value_backup: ValueBackupOperatorSpec = Field(
+        default_factory=ValueBackupOperatorSpec
+    )
     allocation: AllocationPolicySpec = Field(default_factory=AllocationPolicySpec)
     expansion: ExpansionPolicySpec = Field(default_factory=ExpansionPolicySpec)
 
@@ -892,11 +901,25 @@ class RewardEvaluation(SearchModel):
     evaluator_version: int = Field(ge=1)
     config_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     status: RewardEvaluationStatus
-    reward: float | None = Field(default=None, allow_inf_nan=False)
-    state_value: float | None = Field(default=None, allow_inf_nan=False)
+    attempt_reward: float | None = Field(default=None, allow_inf_nan=False)
+    settled_value: float | None = Field(default=None, allow_inf_nan=False)
     components: dict[str, float] = Field(default_factory=dict)
     error: str | None = None
     created_at: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_value_names(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        payload = dict(value)
+        legacy_reward = payload.pop("reward", None)
+        legacy_state_value = payload.pop("state_value", None)
+        if "attempt_reward" not in payload and legacy_reward is not None:
+            payload["attempt_reward"] = legacy_reward
+        if "settled_value" not in payload and legacy_state_value is not None:
+            payload["settled_value"] = legacy_state_value
+        return payload
 
     @field_validator("components")
     @classmethod
@@ -911,14 +934,49 @@ class RewardEvaluation(SearchModel):
 
     @model_validator(mode="after")
     def status_matches_payload(self) -> "RewardEvaluation":
-        if self.status == "evaluated" and self.reward is None:
-            raise ValueError("evaluated reward requires a reward value")
+        if self.status == "evaluated" and self.attempt_reward is None:
+            raise ValueError("evaluated reward requires an attempt_reward value")
         if self.status == "error" and not self.error:
             raise ValueError("reward error status requires an error message")
         return self
 
+    @property
+    def reward(self) -> float | None:
+        """Compatibility accessor for pre-value-layer callers."""
+
+        return self.attempt_reward
+
+    @property
+    def state_value(self) -> float | None:
+        """Compatibility accessor for pre-value-layer callers."""
+
+        return self.settled_value
+
+
+class NodeValueRecord(SearchModel):
+    schema_version: Literal[1] = 1
+    node_id: str = Field(min_length=1)
+    candidate_id: str = Field(min_length=1)
+    iteration: int = Field(ge=1)
+    evidence_commit: str = Field(min_length=1)
+    reward_id: str = Field(min_length=1)
+    settled_value: float = Field(allow_inf_nan=False)
+    backed_up_value: float = Field(allow_inf_nan=False)
+    backup_operator_name: str = Field(default="identity", min_length=1)
+    backup_operator_version: int = Field(default=1, ge=1)
+    backup_config_hash: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    backup_count: int = Field(default=0, ge=0)
+    backup_mean_return: float | None = Field(default=None, allow_inf_nan=False)
+    backup_best_return: float | None = Field(default=None, allow_inf_nan=False)
+    created_at: str
+    updated_at: str
+
 
 class ExpansionSource(SearchModel):
+    node_id: str = Field(min_length=1)
     candidate_id: str = Field(min_length=1)
     iteration: int = Field(ge=1)
     evidence_commit: str = Field(min_length=1)
@@ -926,7 +984,90 @@ class ExpansionSource(SearchModel):
     artifact_hash: str = Field(min_length=1)
     score: float = Field(allow_inf_nan=False)
     reward_id: str = Field(min_length=1)
-    state_value: float = Field(allow_inf_nan=False)
+    settled_value: float = Field(allow_inf_nan=False)
+    backed_up_value: float = Field(allow_inf_nan=False)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_state_value(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        payload = dict(value)
+        legacy_state_value = payload.pop("state_value", None)
+        if "settled_value" not in payload and legacy_state_value is not None:
+            payload["settled_value"] = legacy_state_value
+        if "backed_up_value" not in payload and legacy_state_value is not None:
+            payload["backed_up_value"] = legacy_state_value
+        if "node_id" not in payload:
+            candidate_id = str(payload.get("candidate_id") or "candidate")
+            iteration = int(payload.get("iteration") or 0)
+            commit = str(payload.get("evidence_commit") or "no-commit")
+            payload["node_id"] = (
+                f"node_{candidate_id}_{iteration:04d}_{commit[:12]}"
+            )
+        return payload
+
+    @property
+    def state_value(self) -> float:
+        """Compatibility accessor for pre-value-layer callers."""
+
+        return self.backed_up_value
+
+
+class ValueBackupTarget(SearchModel):
+    candidate_id: str = Field(min_length=1)
+    node_id: str = Field(min_length=1)
+    distance: int = Field(ge=1)
+    return_value: float = Field(allow_inf_nan=False)
+
+
+class ValueBackupEvent(SearchModel):
+    schema_version: Literal[1] = 1
+    event_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    source_candidate_id: str = Field(min_length=1)
+    source_iteration: int = Field(ge=1)
+    source_reward_id: str = Field(min_length=1)
+    operator_name: str = Field(min_length=1)
+    operator_version: int = Field(ge=1)
+    config_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    attempt_reward: float = Field(allow_inf_nan=False)
+    settled_value: float = Field(allow_inf_nan=False)
+    targets: list[ValueBackupTarget] = Field(min_length=1)
+    created_at: str
+
+
+class AllocationSourceSnapshot(SearchModel):
+    candidate_id: str = Field(min_length=1)
+    node_id: str = Field(min_length=1)
+    iteration: int = Field(ge=1)
+    allocation_depth: int = Field(ge=0)
+    settled_value: float = Field(allow_inf_nan=False)
+    backed_up_value: float = Field(allow_inf_nan=False)
+    expansion_visits: int = Field(ge=0)
+    exploration_bonus: float = Field(ge=0, allow_inf_nan=False)
+    priority: float = Field(allow_inf_nan=False)
+    eligible: bool
+    ineligible_reason: str | None = None
+
+
+class AllocationStateSnapshot(SearchModel):
+    schema_version: Literal[1] = 1
+    trigger_candidate_id: str = Field(min_length=1)
+    trigger_iteration: int = Field(ge=1)
+    evaluated_attempts: int = Field(ge=1)
+    total_evaluated_attempts: int = Field(ge=1)
+    recent_attempt_rewards: list[float] = Field(min_length=1)
+    recent_mean_reward: float = Field(allow_inf_nan=False)
+    recent_standard_error: float = Field(ge=0, allow_inf_nan=False)
+    lane_exploration_bonus: float = Field(ge=0, allow_inf_nan=False)
+    lane_upper_confidence_bound: float = Field(allow_inf_nan=False)
+    nonpositive_fraction: float = Field(ge=0, le=1, allow_inf_nan=False)
+    materialized_candidates: int = Field(ge=0)
+    pending_expansions: int = Field(ge=0)
+    max_candidates: int = Field(gt=0)
+    source_options: list[AllocationSourceSnapshot] = Field(default_factory=list)
+    created_at: str
 
 
 class AllocationAction(SearchModel):
@@ -960,6 +1101,10 @@ class AllocationDecision(SearchModel):
     policy_name: str = Field(min_length=1)
     policy_version: int = Field(ge=1)
     config_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    state_snapshot: AllocationStateSnapshot | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     actions: list[AllocationAction] = Field(min_length=1)
     status: AllocationDecisionStatus = "pending"
     created_at: str
@@ -1190,6 +1335,14 @@ class IterationRecord(SearchModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    value_backup_event_id: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    value_backup_error: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     allocation_decision_id: str | None = Field(
         default=None,
         exclude_if=lambda value: value is None,
@@ -1333,6 +1486,10 @@ class CandidateRecord(SearchModel):
     promotion_evidence: PromotionEvidence | None = None
     pending_tool_copies: list[ToolCopyReceipt] = Field(default_factory=list, exclude_if=lambda value: not value)
     iterations: list[IterationRecord] = Field(default_factory=list)
+    node_values: list[NodeValueRecord] = Field(
+        default_factory=list,
+        exclude_if=lambda value: not value,
+    )
     results_ledger: list[ResultLedgerEntry] = Field(default_factory=list)
     results_ledger_git_head: str | None = None
 

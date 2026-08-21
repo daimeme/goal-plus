@@ -2141,6 +2141,21 @@ def test_parallel_loops_rejects_second_plan_and_reuses_initial_candidates(
         runtime.plan_next(run_id, requested_k=1)
 
     session = runtime.start_agent_session(run_id, tasks[0].candidate_id)
+    report = runtime.run_verifier(
+        run_id,
+        tasks[0].candidate_id,
+        agent_session_id=session.agent_session_id,
+        hypothesis="verify the ordinary parallel loop path",
+    )
+    record = runtime._load_candidate_record(run_id, tasks[0].candidate_id)
+
+    assert report.reward_evaluation is None
+    assert report.allocation_decision is None
+    assert record.iterations[-1].reward_evaluation is None
+    assert record.iterations[-1].value_backup_event_id is None
+    assert record.iterations[-1].allocation_decision_id is None
+    assert record.node_values == []
+
     continued = runtime.continue_agent_session(session.agent_session_id)
     assert continued.agent_session_id == session.agent_session_id
     assert continued.candidate_id == tasks[0].candidate_id

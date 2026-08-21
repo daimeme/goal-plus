@@ -404,6 +404,18 @@ def test_strategy_spec_accepts_parallel_loop_orchestration() -> None:
     with pytest.raises(ValidationError):
         StrategySpec(orchestration_mode="conductor")  # type: ignore[arg-type]
 
+    with pytest.raises(
+        ValidationError,
+        match="strategy.adaptive_search requires orchestration_mode=adaptive_search",
+    ):
+        StrategySpec(adaptive_search={})
+
+    with pytest.raises(
+        ValidationError,
+        match="strategy.adaptive_search is required for adaptive_search mode",
+    ):
+        StrategySpec(orchestration_mode="adaptive_search")
+
 
 def test_strategy_spec_accepts_worker_budget() -> None:
     spec = StrategySpec(

@@ -205,6 +205,15 @@ def test_codex_assets_document_runtime_owned_adaptive_allocation() -> None:
     assert "search_apply_allocation_decision" in skill
     assert "spawn_agent" in skill
     assert "reward 只用于 allocation" in skill
+    assert "metric_progress/v2" in skill
+    assert "ValueBackupEvent" in skill
+    assert "AllocationStateSnapshot" in skill
+    assert "当前推荐的 value-guided 组合" in skill
+    assert "不按" in skill
+    assert "name/version 分支" in skill
+    assert "所有 runtime 已注册并通过 freeze" in skill
+    assert "普通 `parallel_loops` 不计算 reward/value backup" in skill
+    assert "不创建质量驱动的替代 candidate" in skill
     assert "annotation task" in skill
     assert "互不依赖的结算后分支" in skill
     assert "缺失 task 会从已持久化 iteration 幂等补齐" in skill

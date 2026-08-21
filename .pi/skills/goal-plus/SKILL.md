@@ -129,13 +129,23 @@ Pi 支持的 strategy name 仅限以下可移植内置子集：
 candidate/subagent 数。
 每个初始候选工作区都是长期自主循环，不创建后续规划轮次或基于质量的替代项。
 
-`adaptive_search` 第一版使用 `budget.max_parallel` 作为所有 pool 合计的 live worker 上限，并
-要求显式设置 `budget.max_candidates` 作为整个 run 的唯一 candidate 上限。配置组件固定为
-`reward={name: metric_progress, version: 1}`、
-`allocation={name: low_reward_replace, version: 1}` 和
+`adaptive_search` 使用 `budget.max_parallel` 作为所有 pool 合计的 live worker 上限，并
+要求显式设置 `budget.max_candidates` 作为整个 run 的唯一 candidate 上限。当前推荐的
+value-guided 组合为
+`reward={name: metric_progress, version: 2}`、
+`value_backup={name: discounted_mean_best, version: 1}`、
+`allocation={name: value_guided_replace, version: 1}` 和
 `expansion={source_policy: highest_value, model_policy: inherit_source, max_depth: ...}`。
+兼容组合仍可使用 `metric_progress/v1`、`identity/v1` 和 `low_reward_replace/v1`；各组件
+按 name/version 由 runtime 注册并在 freeze 时校验。Pi worker 与 supervisor 的执行协议不按
+组件 name/version 分支，只消费 runtime 返回的持久化 decision。Pi extension 的严格 schema
+列出当前已注册组件；新增 runtime 组件时必须同步更新该 schema 与资产测试。
 runtime 在 verifier 结算后隔离计算 reward，并持久化 retire/expand decision；Pi supervisor
 不计算 reward、不选择 candidate，也不自动 refill。
+其中 `attempt_reward` 表示本次尝试增量，`settled_value` 表示回滚/保留后的 incumbent 效用，
+`NodeValueRecord.backed_up_value` 是 allocation 的派生来源值。runtime 通过不可变 backup event
+重放 mean/best/backed value，并把 lane UCB 与 source priority 固定在 decision snapshot 中。
+Pi worker 和 supervisor 都不计算或改写这些值。
 decision 对外可见前，触发 iteration 的 Git/results ledger 已结算。annotation task 注册与
 reward/allocation 互不作为前置条件，缺失 task 会从已持久化 iteration 幂等补齐。
 retirement 只禁止该 candidate 的下一轮 iteration；结束 Pi worker 不会取消 annotator 或删除

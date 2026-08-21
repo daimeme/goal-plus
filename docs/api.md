@@ -61,12 +61,23 @@ call. `budget.max_parallel` is the single initial candidate/live-worker count.
 
 An explicitly configured `adaptive_search` run still has one initial plan, but
 may replace a retired lane through persisted runtime decisions. It requires a
-Git worktree and `budget.max_candidates`. The v1 registered components are
-`metric_progress/v1` and `low_reward_replace/v1`; their params are isolated
+Git worktree and `budget.max_candidates`. Compatibility components are
+`metric_progress/v1`, `identity/v1`, and `low_reward_replace/v1`. The
+value-guided path uses `metric_progress/v2`, `discounted_mean_best/v1`, and
+`value_guided_replace/v1`; their params are isolated
 under `strategy.adaptive_search`. A verifier report may include
 `reward_evaluation` and `allocation_decision`. The main agent applies the exact
 decision and launches the returned session payload; it does not author a
 replacement. Reward never replaces the hard metric used by `search_select`.
+`reward_evaluation.attempt_reward` is the normalized result of the attempted
+edge, while `settled_value` is the candidate-local value after keep/retain or
+restore. Accepted settled Evidence also creates a durable `NodeValueRecord`;
+allocation ranks sources by its `backed_up_value`. V2 preserves negative
+attempt quality after a discard, while immutable `ValueBackupEvent` records
+are replayed into each ancestor node's mean, best, and backed-up value. A
+value-guided decision embeds the atomic `AllocationStateSnapshot` used for its
+lane UCB and source priority. Legacy `reward` and `state_value` fields remain
+readable but are not written by new settlements.
 Before a decision becomes visible, its triggering iteration has completed Git
 and results-ledger settlement. Annotation task registration and reward/allocation
 are independent post-settlement branches: failure in either branch does not block
@@ -301,6 +312,7 @@ goal-plus-pi-tool goal_plus_monitor_snapshot \
 | `budget.max_candidates` | optional total unique candidate ceiling; required by `adaptive_search` |
 | `strategy.orchestration_mode` | `parallel_loops` or explicitly configured `adaptive_search` |
 | `strategy.adaptive_search.reward` | registered reward evaluator name/version/params |
+| `strategy.adaptive_search.value_backup` | registered value-backup operator name/version/params |
 | `strategy.adaptive_search.allocation` | registered allocation policy name/version/params |
 | `strategy.adaptive_search.expansion` | source/model policy, depth cap, and optional derived-worker budget |
 | `strategy.worker_host` | maintained execution host: `pi-rpc` or `codex` |

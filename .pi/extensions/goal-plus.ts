@@ -122,6 +122,17 @@ const AdaptiveSearchSpec = Type.Object(
 		reward: Type.Optional(Type.Object(
 			{
 				name: Type.Optional(Type.Literal("metric_progress")),
+				version: Type.Optional(Type.Union([Type.Literal(1), Type.Literal(2)])),
+				params: Type.Optional(LooseObject),
+			},
+			{ additionalProperties: false },
+		)),
+		value_backup: Type.Optional(Type.Object(
+			{
+				name: Type.Optional(Type.Union([
+					Type.Literal("identity"),
+					Type.Literal("discounted_mean_best"),
+				])),
 				version: Type.Optional(Type.Literal(1)),
 				params: Type.Optional(LooseObject),
 			},
@@ -129,7 +140,10 @@ const AdaptiveSearchSpec = Type.Object(
 		)),
 		allocation: Type.Optional(Type.Object(
 			{
-				name: Type.Optional(Type.Literal("low_reward_replace")),
+				name: Type.Optional(Type.Union([
+					Type.Literal("low_reward_replace"),
+					Type.Literal("value_guided_replace"),
+				])),
 				version: Type.Optional(Type.Literal(1)),
 				params: Type.Optional(LooseObject),
 			},

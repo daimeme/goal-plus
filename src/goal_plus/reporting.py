@@ -1357,6 +1357,8 @@ def _report_iteration_payload(
             if iteration.reward_evaluation is not None
             else None
         ),
+        "value_backup_event_id": iteration.value_backup_event_id,
+        "value_backup_error": iteration.value_backup_error,
         "allocation_decision_id": iteration.allocation_decision_id,
         "allocation_decision_error": iteration.allocation_decision_error,
         "restored_to_iteration": iteration.restored_to_iteration,
@@ -1455,6 +1457,14 @@ def _task_details(
                 "expansion_source": (
                     candidate.task.expansion_source.model_dump(mode="json")
                     if candidate.task.expansion_source is not None
+                    else None
+                ),
+                "node_values": [
+                    item.model_dump(mode="json") for item in candidate.node_values
+                ],
+                "last_node_value": (
+                    candidate.node_values[-1].model_dump(mode="json")
+                    if candidate.node_values
                     else None
                 ),
                 "hypothesis": candidate.task.hypothesis,
@@ -1685,6 +1695,10 @@ def _task_details(
             (run_dir / "allocation-decisions").glob("allocation_*.json")
         )
     ]
+    value_backups = [
+        load_json(path)
+        for path in sorted((run_dir / "value-backups").glob("backup_*.json"))
+    ]
     return {
         **task_summary,
         "is_report_run": run_id == report_run_id,
@@ -1701,6 +1715,7 @@ def _task_details(
         },
         "plans": plan_payloads,
         "allocation_decisions": allocation_decisions,
+        "value_backups": value_backups,
         "candidates": candidate_payloads,
         "sessions": session_payloads,
     }
@@ -3703,7 +3718,16 @@ def _render_shared_evidence_view(task: dict[str, Any]) -> str:
         reward = item.get("reward_evaluation")
         reward_copy = "Not observed"
         if isinstance(reward, dict):
-            reward_copy = _number(reward.get("reward"), digits=3)
+            attempt_reward = reward.get("attempt_reward", reward.get("reward"))
+            settled_value = reward.get("settled_value", reward.get("state_value"))
+            reward_copy = (
+                f"attempt {_number(attempt_reward, digits=3)}"
+                f" | settled {_number(settled_value, digits=3)}"
+            )
+            if item.get("value_backup_event_id"):
+                reward_copy += f" | {_text(item.get('value_backup_event_id'))}"
+            elif item.get("value_backup_error"):
+                reward_copy += " | backup error"
             if item.get("allocation_decision_id"):
                 reward_copy += f" | {_text(item.get('allocation_decision_id'))}"
             elif item.get("allocation_decision_error"):
@@ -3777,6 +3801,7 @@ def _render_candidates(task: dict[str, Any]) -> str:
         return "<p>No candidates were persisted.</p>"
     rows = []
     for candidate in candidates:
+        last_node_value = candidate.get("last_node_value") or {}
         rows.append(
             f'<tr class="{"selected-row" if candidate.get("selected") else ""}">'
             f'<td class="mono"><strong>{_html(candidate.get("candidate_id"))}</strong></td>'
@@ -3786,6 +3811,7 @@ def _render_candidates(task: dict[str, Any]) -> str:
             f'<td class="mono">{_html((candidate.get("expansion_source") or {}).get("candidate_id"))}</td>'
             f'<td class="mono">{_html(_number(candidate.get("score")))}</td>'
             f'<td class="mono">{_html(_number(candidate.get("best_score")))}</td>'
+            f'<td class="mono">{_html(_number(last_node_value.get("backed_up_value")))}</td>'
             f'<td>{_html(candidate.get("process_passed"))}</td>'
             f'<td class="mono">{_html(candidate.get("iterations_total"))}</td>'
             f'<td class="mono">{_html(", ".join(candidate.get("session_ids") or []) or None)}</td>'
@@ -3796,7 +3822,7 @@ def _render_candidates(task: dict[str, Any]) -> str:
     return (
         '<div class="table-scroll"><table><thead><tr>'
         "<th>Candidate</th><th>Status</th><th>Allocation</th><th>Depth</th><th>Source</th><th>Final score</th><th>Best score</th>"
-        "<th>Process pass</th><th>Iterations</th><th>Sessions</th><th>Changed files</th><th>Hypothesis</th>"
+        "<th>Backed value</th><th>Process pass</th><th>Iterations</th><th>Sessions</th><th>Changed files</th><th>Hypothesis</th>"
         f'</tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
     )
 

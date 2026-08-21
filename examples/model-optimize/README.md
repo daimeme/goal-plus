@@ -36,6 +36,8 @@ the CPU thread count is not a valid optimization.
   model selection under shared Annotated Evidence
 - `torch-cpu-target/multi-model-run.md`: `scaling` Conda and
   Codex CLI runbook with runtime-evidence acceptance criteria
+- `torch-cpu-target/adaptive-search-spec.json`: Reward V2, durable value backup,
+  and value-guided allocation validation
 - `pi-goal-prompt.md`: minimal user-level `/goal-plus` request
 
 ## Boundary

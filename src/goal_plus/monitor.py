@@ -839,6 +839,17 @@ def goal_plus_monitor_snapshot(
             ),
             "items": allocation_decisions,
         }
+        value_backup_paths = sorted(
+            (run_path / "value-backups").glob("backup_*.json")
+        )
+        value_backups = [load_json(path) for path in value_backup_paths]
+        run_payload["value_backups"] = {
+            "total": len(value_backups),
+            "target_updates": sum(
+                len(item.get("targets") or []) for item in value_backups
+            ),
+            "items": value_backups,
+        }
 
         for candidate in candidates:
             candidate_sessions = sessions_by_candidate.get(candidate.candidate_id, [])
@@ -902,6 +913,22 @@ def goal_plus_monitor_snapshot(
                 "last_reward_evaluation": (
                     last_iteration.reward_evaluation.model_dump(mode="json")
                     if last_iteration and last_iteration.reward_evaluation is not None
+                    else None
+                ),
+                "node_value_count": len(candidate.node_values),
+                "last_node_value": (
+                    candidate.node_values[-1].model_dump(mode="json")
+                    if candidate.node_values
+                    else None
+                ),
+                "last_value_backup_event_id": (
+                    last_iteration.value_backup_event_id
+                    if last_iteration
+                    else None
+                ),
+                "last_value_backup_error": (
+                    last_iteration.value_backup_error
+                    if last_iteration
                     else None
                 ),
                 "last_allocation_decision_id": (

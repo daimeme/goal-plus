@@ -202,6 +202,13 @@ def test_pi_assets_document_runtime_owned_adaptive_allocation() -> None:
     assert 'orchestration_mode: "adaptive_search"' in skill
     assert "只有目标或 benchmark 明确要求 runtime reward/allocation 时才使用" in skill
     assert "budget.max_candidates" in skill
+    assert "discounted_mean_best" in skill
+    assert "value_guided_replace" in skill
+    assert "当前推荐的" in skill
+    assert "兼容组合仍可使用" in skill
+    assert "不按" in skill
+    assert "组件 name/version 分支" in skill
+    assert "新增 runtime 组件时必须同步更新" in skill
     assert "search_list_allocation_decisions" in skill
     assert "search_apply_allocation_decision" in skill
     assert "手动 pool submit" in skill
@@ -217,6 +224,7 @@ def test_pi_assets_document_runtime_owned_adaptive_allocation() -> None:
     assert 'Type.Literal("adaptive_search")' in extension
     assert "max_candidates: Type.Optional" in extension
     assert "const AdaptiveSearchSpec" in extension
+    assert "value_backup: Type.Optional" in extension
     assert "search_list_allocation_decisions: Type.Object" in extension
     assert "search_apply_allocation_decision: Type.Object" in extension
     assert "仅当当前 FrozenSpec 显式设置 orchestration_mode=adaptive_search" in extension

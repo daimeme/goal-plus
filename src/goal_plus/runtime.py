@@ -36,9 +36,13 @@ from goal_plus.agent_hosts import (
 from goal_plus.adaptive_search import (
     AllocationContext,
     RewardContext,
+    ValueBackupContext,
     allocation_config_hash,
+    create_value_backup_event,
     decide_allocation,
     evaluate_reward,
+    materialize_node_values,
+    replay_value_backups,
     validate_adaptive_search_spec,
 )
 from goal_plus.models import (
@@ -81,6 +85,7 @@ from goal_plus.models import (
     VerifierInvalidationReason,
     VerifierResult,
     VerifierRole,
+    ValueBackupEvent,
     WorkerBudget,
     WorkerLaunchOptions,
 )
@@ -1354,6 +1359,7 @@ class FileSearchRuntime:
             policy_name=policy.name,
             policy_version=policy.version,
             config_hash=allocation_config_hash(adaptive_spec),
+            state_snapshot=recommendation.state_snapshot,
             actions=[
                 AllocationAction(
                     action_id=f"{decision_id}:retire",
@@ -1368,7 +1374,7 @@ class FileSearchRuntime:
                     new_candidate_id=child_id,
                     worker_budget=adaptive_spec.expansion.worker_budget,
                     reason=(
-                        "replace the retired lane from the highest-value "
+                        "replace the retired lane from the runtime-selected "
                         "verifier-backed source"
                     ),
                 ),
@@ -1380,6 +1386,53 @@ class FileSearchRuntime:
         iteration.allocation_decision_id = decision_id
         self._write_allocation_decision(decision)
         return decision
+
+    def _settle_value_backups_locked(
+        self,
+        run: RunRecord,
+        frozen: FrozenSpec,
+        record: CandidateRecord,
+        iteration: IterationRecord,
+    ) -> ValueBackupEvent | None:
+        adaptive_spec = frozen.spec.strategy.adaptive_search
+        reward = iteration.reward_evaluation
+        if adaptive_spec is None or reward is None or reward.status != "evaluated":
+            return None
+
+        persisted_records = self._load_candidate_records(run.run_id)
+        records = [
+            record if item.candidate_id == record.candidate_id else item
+            for item in persisted_records
+        ]
+        if not any(item.candidate_id == record.candidate_id for item in records):
+            records.append(record)
+        for item in records:
+            item.node_values = materialize_node_values(item, adaptive_spec)
+
+        event = create_value_backup_event(
+            adaptive_spec,
+            ValueBackupContext(
+                run_id=run.run_id,
+                trigger_record=record,
+                records=records,
+                reward=reward,
+                created_at=iteration.created_at,
+            ),
+        )
+        events = self._load_value_backup_events(run.run_id)
+        if event is not None and not any(
+            item.event_id == event.event_id for item in events
+        ):
+            self._write_value_backup_event(event)
+            events.append(event)
+
+        replay_value_backups(adaptive_spec, records, events)
+        for item in records:
+            if item.candidate_id == record.candidate_id:
+                record.node_values = item.node_values
+            else:
+                self._write_candidate_record(run.run_id, item)
+        return event
 
     def plan_next(self, run_id: str, requested_k: int = 4) -> SearchPlan:
         with self._run_transaction(run_id):
@@ -2816,6 +2869,14 @@ class FileSearchRuntime:
             allocation_decision: AllocationDecision | None = None
             adaptive_spec = frozen.spec.strategy.adaptive_search
             if adaptive_spec is not None:
+                verifier_elapsed_seconds = sum(
+                    float(elapsed)
+                    for result in report.verifier_results
+                    for elapsed in [result.metrics.get("elapsed_seconds")]
+                    if isinstance(elapsed, (int, float))
+                    and math.isfinite(float(elapsed))
+                    and float(elapsed) >= 0
+                )
                 reward = evaluate_reward(
                     adaptive_spec,
                     RewardContext(
@@ -2828,10 +2889,24 @@ class FileSearchRuntime:
                         previous_best_score=previous_best_score,
                         metric_direction=frozen.spec.metric_direction,
                         created_at=created_at,
+                        verifier_elapsed_seconds=verifier_elapsed_seconds,
                     ),
                 )
                 iteration.reward_evaluation = reward
             record.iterations.append(iteration)
+            if adaptive_spec is not None:
+                record.node_values = materialize_node_values(record, adaptive_spec)
+                try:
+                    backup_event = self._settle_value_backups_locked(
+                        run,
+                        frozen,
+                        record,
+                        iteration,
+                    )
+                    if backup_event is not None:
+                        iteration.value_backup_event_id = backup_event.event_id
+                except Exception as exc:
+                    iteration.value_backup_error = f"{type(exc).__name__}: {exc}"
             if adaptive_spec is not None and agent_session_id is not None:
                 try:
                     allocation_decision = self._create_allocation_decision_locked(
@@ -7213,6 +7288,24 @@ class FileSearchRuntime:
 
     def _allocation_decision_dir(self, run_id: str) -> Path:
         return self._run_dir(run_id) / "allocation-decisions"
+
+    def _value_backup_dir(self, run_id: str) -> Path:
+        return self._run_dir(run_id) / "value-backups"
+
+    def _load_value_backup_events(self, run_id: str) -> list[ValueBackupEvent]:
+        directory = self._value_backup_dir(run_id)
+        if not directory.exists():
+            return []
+        return [
+            ValueBackupEvent.model_validate(load_json(path))
+            for path in sorted(directory.glob("backup_*.json"))
+        ]
+
+    def _write_value_backup_event(self, event: ValueBackupEvent) -> None:
+        write_json(
+            self._value_backup_dir(event.run_id) / f"{event.event_id}.json",
+            event.model_dump(mode="json"),
+        )
 
     def _load_allocation_decision(
         self,

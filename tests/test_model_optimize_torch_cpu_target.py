@@ -118,6 +118,20 @@ def test_cpp_reference_fused_op_is_present_and_documented() -> None:
     assert "TORCH_LIBRARY" in text
 
 
+def test_torch_cpu_adaptive_spec_uses_value_guided_components() -> None:
+    spec = json.loads(
+        TARGET.joinpath("adaptive-search-spec.json").read_text(encoding="utf-8")
+    )
+    adaptive = spec["strategy"]["adaptive_search"]
+
+    assert adaptive["reward"]["version"] == 2
+    assert adaptive["value_backup"]["name"] == "discounted_mean_best"
+    assert adaptive["allocation"]["name"] == "value_guided_replace"
+    assert adaptive["allocation"]["params"]["window_size"] <= (
+        adaptive["allocation"]["params"]["min_attempts"]
+    )
+
+
 @pytest.mark.pi
 def test_pi_goal_skill_and_user_prompt_are_minimal_goal_inputs() -> None:
     skill_files = sorted(

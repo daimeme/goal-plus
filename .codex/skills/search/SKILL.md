@@ -70,8 +70,9 @@ budget:
 strategy:
   orchestration_mode: adaptive_search
   adaptive_search:
-    reward: {name: metric_progress, version: 1, params: {}}
-    allocation: {name: low_reward_replace, version: 1, params: {}}
+    reward: {name: metric_progress, version: 2, params: {}}
+    value_backup: {name: discounted_mean_best, version: 1, params: {}}
+    allocation: {name: value_guided_replace, version: 1, params: {}}
     expansion:
       source_policy: highest_value
       model_policy: inherit_source
@@ -80,12 +81,24 @@ workspace:
   backend: git_worktree
 ```
 
+以上是当前推荐的 value-guided 组合，不是 host prompt 绑定。worker 与父 agent 的执行协议不按
+reward、value backup 或 allocation 的 name/version 分支；对所有 runtime 已注册并通过 freeze
+校验的组件组合，都只消费 runtime 返回的持久化 `allocation_decision`。
+
 `max_parallel` 是任一时刻的 live worker 上限，`max_candidates` 是整个 run 可物化的唯一
-candidate 上限。reward evaluator 在 verifier 结算后运行；allocation policy 只读取单个候选的
-连续 reward 与已持久化候选状态。两者都是 runtime 中按 name/version 注册的可替换组件。
+candidate 上限。reward evaluator 在 verifier 结算后只读取当前尝试；allocation policy 在同一
+run transaction 中读取已持久化的全局候选/node 状态。组件都按 name/version 注册并可替换。
 reward 或 policy 错误只记录到 iteration，不能改变硬 score、candidate settlement、选择或
 promotion。annotation task 注册与 reward/allocation 是互不依赖的结算后分支：任一侧失败不阻止
 另一侧，缺失 task 会从已持久化 iteration 幂等补齐。
+
+Runtime 将 value layer 分为三个持久化概念：`attempt_reward` 是本次尝试的归一化即时回报，
+`metric_progress/v2` 保留退化尝试的负质量信号；`settled_value` 是结算后 candidate-local incumbent
+的绝对效用；`NodeValueRecord.backed_up_value` 是 allocation 使用的节点值。派生结果生成不可变
+`ValueBackupEvent`，runtime 重放事件得到 mean/best/backed value。`value_guided_replace/v1` 依据近期
+reward 的 UCB 决定退休，并把当时全部候选与 source priority 固定进 `AllocationStateSnapshot`。
+兼容 run 仍可使用 v1 reward、identity backup 和 low-reward policy。worker 和主 agent 都不自行计算
+或改写这些值。
 
 当 worker verifier 返回 `allocation_decision` 时，当前 candidate 已被 runtime fence。父 agent
 完成该 worker 的终态绑定后，调用 `search_list_allocation_decisions(status="pending")`，再对准确
@@ -100,9 +113,11 @@ Git/results ledger 结算；annotation task 无论在 decision 前还是 retirem
 Evidence。停止 worker 不会取消 annotator，也不会从 Global Evidence 删除该结果。task 尚未注册或
 View 生成期间允许 `view=null`，父 agent 和 worker 都不等待或轮询 View。
 
-第一版没有价值回传、UCB、动态搜索宽度、探索配额或多候选原子 allocation。`best.json`、
-`search_select` 和 promotion 仍只使用硬 verifier score；reward 只用于 allocation。未返回
+`search_select` 和 promotion 仍只使用硬 verifier score；reward 只用于 allocation，backed value
+只用于 source priority。未返回
 allocation decision 时，继续规则与 `parallel_loops` 相同。
+普通 `parallel_loops` 不计算 reward/value backup，不调用
+`search_list_allocation_decisions` 或 `search_apply_allocation_decision`，也不创建质量驱动的替代 candidate。
 
 ## Search Run 预算规划
 

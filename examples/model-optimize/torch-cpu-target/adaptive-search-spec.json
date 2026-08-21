@@ -68,19 +68,38 @@
     "adaptive_search": {
       "reward": {
         "name": "metric_progress",
+        "version": 2,
+        "params": {
+          "epsilon": 1e-09,
+          "reward_clip": 4.0,
+          "value_scale": 1.0,
+          "quality_weight": 1.0,
+          "regression_weight": 1.25,
+          "failure_penalty": 1.0,
+          "cost_weight": 0.0,
+          "cost_scale_seconds": 60.0
+        }
+      },
+      "value_backup": {
+        "name": "discounted_mean_best",
         "version": 1,
         "params": {
-          "score_scale": 1000.0,
-          "failure_reward": -1.0
+          "discount": 0.9,
+          "attempt_reward_weight": 0.5,
+          "best_weight": 0.25
         }
       },
       "allocation": {
-        "name": "low_reward_replace",
+        "name": "value_guided_replace",
         "version": 1,
         "params": {
-          "min_iterations": 2,
-          "consecutive_below": 2,
-          "reward_threshold": 0.0
+          "min_attempts": 3,
+          "window_size": 2,
+          "retire_threshold": 0.08,
+          "exploration_weight": 0.05,
+          "uncertainty_weight": 1.0,
+          "nonpositive_fraction": 1.0,
+          "source_exploration_weight": 0.05
         }
       },
       "expansion": {
