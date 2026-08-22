@@ -22,7 +22,11 @@ from goal_plus.models import (
     SearchPlan,
 )
 from goal_plus.monitor import goal_plus_monitor_snapshot
-from goal_plus.runtime import FileSearchRuntime, load_json
+from goal_plus.runtime import (
+    FileSearchRuntime,
+    load_adaptive_search_projections,
+    load_json,
+)
 
 
 REPORT_SCHEMA_VERSION = 1
@@ -1285,6 +1289,8 @@ def _report_iteration_payload(
     run_id: str,
     candidate_id: str,
     iteration: IterationRecord,
+    *,
+    adaptive_search_enabled: bool,
 ) -> dict[str, Any]:
     annotation_path = (
         run_dir
@@ -1338,7 +1344,7 @@ def _report_iteration_payload(
                     raise RuntimeError("evidence annotation monitor does not match iteration")
                 annotation_monitor = monitor
 
-    return {
+    payload = {
         "candidate_id": candidate_id,
         "iteration": iteration.iteration,
         "agent_session_id": iteration.agent_session_id,
@@ -1352,15 +1358,6 @@ def _report_iteration_payload(
         "failure_class": iteration.failure_class,
         "git_head": iteration.git_head,
         "disposition": iteration.disposition,
-        "reward_evaluation": (
-            iteration.reward_evaluation.model_dump(mode="json")
-            if iteration.reward_evaluation is not None
-            else None
-        ),
-        "value_backup_event_id": iteration.value_backup_event_id,
-        "value_backup_error": iteration.value_backup_error,
-        "allocation_decision_id": iteration.allocation_decision_id,
-        "allocation_decision_error": iteration.allocation_decision_error,
         "restored_to_iteration": iteration.restored_to_iteration,
         "restored_to_git_head": iteration.restored_to_git_head,
         "workspace_git_head_after_settlement": (
@@ -1393,6 +1390,19 @@ def _report_iteration_payload(
         "shared_tool_staged_entries": list(iteration.shared_tool_staged_entries),
         "shared_tool_publish_status": iteration.shared_tool_publish_status,
     }
+    if adaptive_search_enabled:
+        payload.update({
+            "reward_evaluation": (
+                iteration.reward_evaluation.model_dump(mode="json")
+                if iteration.reward_evaluation is not None
+                else None
+            ),
+            "value_backup_event_id": iteration.value_backup_event_id,
+            "value_backup_error": iteration.value_backup_error,
+            "allocation_decision_id": iteration.allocation_decision_id,
+            "allocation_decision_error": iteration.allocation_decision_error,
+        })
+    return payload
 
 
 def _task_details(
@@ -1412,6 +1422,9 @@ def _task_details(
     frozen = FrozenSpec.model_validate(
         load_json(root / "specs" / run.frozen_spec_id / "frozen_spec.json")
     )
+    adaptive_search_enabled = (
+        frozen.spec.strategy.orchestration_mode == "adaptive_search"
+    )
     plans = _load_models(run_dir / "plans", "plan_*.json", SearchPlan)
     candidates = _load_models(
         run_dir / "candidates", "*/candidate.json", CandidateRecord
@@ -1429,6 +1442,19 @@ def _task_details(
             session.agent_session_id
         )
 
+    graph, values = load_adaptive_search_projections(
+        run_dir,
+        orchestration_mode=frozen.spec.strategy.orchestration_mode,
+    )
+    graph_nodes_by_id = (
+        {item.node_id: item for item in graph.nodes} if graph is not None else {}
+    )
+    values_by_node_id = (
+        {item.node_id: item for item in values.node_values}
+        if values is not None
+        else {}
+    )
+
     candidate_payloads: list[dict[str, Any]] = []
     for candidate in candidates:
         scored = [
@@ -1443,30 +1469,20 @@ def _task_details(
         if scored:
             reverse = frozen.spec.metric_direction == "maximize"
             best = sorted(scored, key=lambda item: item.score, reverse=reverse)[0]
-        candidate_payloads.append(
-            {
+        current_node_id = (
+            graph.candidate_current_node_ids.get(candidate.candidate_id)
+            if graph is not None
+            else None
+        )
+        current_node = graph_nodes_by_id.get(current_node_id or "")
+        current_value = values_by_node_id.get(current_node_id or "")
+        candidate_payload = {
                 "candidate_id": candidate.candidate_id,
                 "status": candidate.status,
                 "plan_id": candidate.task.plan_id,
                 "parent_id": candidate.task.parent_id,
                 "parent_candidate_ids": candidate.task.parent_candidate_ids,
                 "base_candidate_id": candidate.task.base_candidate_id,
-                "allocation_depth": candidate.task.allocation_depth,
-                "allocation_eligibility": candidate.allocation_eligibility,
-                "retired_by_decision_id": candidate.retired_by_decision_id,
-                "expansion_source": (
-                    candidate.task.expansion_source.model_dump(mode="json")
-                    if candidate.task.expansion_source is not None
-                    else None
-                ),
-                "node_values": [
-                    item.model_dump(mode="json") for item in candidate.node_values
-                ],
-                "last_node_value": (
-                    candidate.node_values[-1].model_dump(mode="json")
-                    if candidate.node_values
-                    else None
-                ),
                 "hypothesis": candidate.task.hypothesis,
                 "selected_model": (
                     candidate.task.selected_model.model
@@ -1515,11 +1531,38 @@ def _task_details(
                         run_id,
                         candidate.candidate_id,
                         iteration,
+                        adaptive_search_enabled=adaptive_search_enabled,
                     )
                     for iteration in candidate.iterations
                 ],
-            }
-        )
+        }
+        if adaptive_search_enabled:
+            candidate_payload.update({
+                "allocation_depth": candidate.task.allocation_depth,
+                "allocation_eligibility": candidate.allocation_eligibility,
+                "retired_by_decision_id": candidate.retired_by_decision_id,
+                "expansion_source": (
+                    candidate.task.expansion_source.model_dump(mode="json")
+                    if candidate.task.expansion_source is not None
+                    else None
+                ),
+                "search_nodes": [
+                    item.model_dump(mode="json")
+                    for item in (graph.nodes if graph is not None else [])
+                    if item.candidate_id == candidate.candidate_id
+                ],
+                "current_search_node": (
+                    current_node.model_dump(mode="json")
+                    if current_node is not None
+                    else None
+                ),
+                "current_value_estimate": (
+                    current_value.model_dump(mode="json")
+                    if current_value is not None
+                    else None
+                ),
+            })
+        candidate_payloads.append(candidate_payload)
 
     FileSearchRuntime.attach_external_evaluations(
         run_id,
@@ -1689,17 +1732,7 @@ def _task_details(
         }
         for plan in plans
     ]
-    allocation_decisions = [
-        load_json(path)
-        for path in sorted(
-            (run_dir / "allocation-decisions").glob("allocation_*.json")
-        )
-    ]
-    value_backups = [
-        load_json(path)
-        for path in sorted((run_dir / "value-backups").glob("backup_*.json"))
-    ]
-    return {
+    task_payload = {
         **task_summary,
         "is_report_run": run_id == report_run_id,
         "run": run.model_dump(mode="json"),
@@ -1714,11 +1747,33 @@ def _task_details(
             "budget": frozen.spec.budget.model_dump(mode="json", exclude_none=True),
         },
         "plans": plan_payloads,
-        "allocation_decisions": allocation_decisions,
-        "value_backups": value_backups,
         "candidates": candidate_payloads,
         "sessions": session_payloads,
     }
+    if adaptive_search_enabled:
+        allocation_decisions = [
+            load_json(path)
+            for path in sorted(
+                (run_dir / "allocation-decisions").glob("allocation_*.json")
+            )
+        ]
+        value_backups = [
+            load_json(path)
+            for path in sorted(
+                (run_dir / "value-backups").glob("backup_*.json")
+            )
+        ]
+        task_payload.update({
+            "allocation_decisions": allocation_decisions,
+            "value_backups": value_backups,
+            "search_graph": (
+                graph.model_dump(mode="json") if graph is not None else None
+            ),
+            "value_projection": (
+                values.model_dump(mode="json") if values is not None else None
+            ),
+        })
+    return task_payload
 
 
 _GOAL_EVENT_LABELS = {
@@ -3444,6 +3499,7 @@ def _render_timeline(
 
 
 def _render_shared_evidence_view(task: dict[str, Any]) -> str:
+    adaptive_enabled = "allocation_decisions" in task
     local_rows = [
         {
             **iteration,
@@ -3732,6 +3788,11 @@ def _render_shared_evidence_view(task: dict[str, Any]) -> str:
                 reward_copy += f" | {_text(item.get('allocation_decision_id'))}"
             elif item.get("allocation_decision_error"):
                 reward_copy += " | policy error"
+        reward_cell = (
+            f'<td class="mono">{_html(reward_copy)}</td>'
+            if adaptive_enabled
+            else ""
+        )
         rows.append(
             f'<tr class="{escape(" ".join(row_classes), quote=True)}"'
             " data-evidence-row"
@@ -3742,7 +3803,7 @@ def _render_shared_evidence_view(task: dict[str, Any]) -> str:
             f'<td class="mono"><strong>{_html(candidate_id)}</strong></td>'
             f'<td class="mono">{_html(item.get("iteration"))}</td>'
             f'<td class="mono">{score_copy}</td>'
-            f'<td class="mono">{_html(reward_copy)}</td>'
+            f"{reward_cell}"
             f"<td>{_status(disposition)}</td>"
             f'<td><div class="evidence-copy">{_html(attempt)}</div></td>'
             f'<td>{view_copy}{view_error}{monitor_copy}<div class="evidence-view-meta">{_status(view_state)}</div></td>'
@@ -3777,7 +3838,8 @@ def _render_shared_evidence_view(task: dict[str, Any]) -> str:
         "</div></div>"
         '<div class="table-scroll evidence-view-scroll">'
         '<table class="evidence-view-table"><thead><tr>'
-        "<th>Time</th><th>Candidate</th><th>Iteration</th><th>Score</th><th>Reward / allocation</th>"
+        "<th>Time</th><th>Candidate</th><th>Iteration</th><th>Score</th>"
+        f'{"<th>Reward / allocation</th>" if adaptive_enabled else ""}'
         "<th>Settlement</th><th>Worker attempt</th><th>Objective View</th>"
         "<th>Toolization Review</th><th>Published Tool View</th>"
         "<th>Tool Adoption Summary</th><th>Revision</th>"
@@ -3799,19 +3861,25 @@ def _render_candidates(task: dict[str, Any]) -> str:
     candidates = task.get("candidates") or []
     if not candidates:
         return "<p>No candidates were persisted.</p>"
+    adaptive_enabled = "allocation_decisions" in task
     rows = []
     for candidate in candidates:
-        last_node_value = candidate.get("last_node_value") or {}
+        current_value = candidate.get("current_value_estimate") or {}
+        adaptive_cells = ""
+        if adaptive_enabled:
+            adaptive_cells = (
+                f'<td>{_status(candidate.get("allocation_eligibility") or "eligible")}</td>'
+                f'<td class="mono">{_html(candidate.get("allocation_depth"))}</td>'
+                f'<td class="mono">{_html((candidate.get("expansion_source") or {}).get("candidate_id"))}</td>'
+                f'<td class="mono">{_html(_number(current_value.get("backed_up_value")))}</td>'
+            )
         rows.append(
             f'<tr class="{"selected-row" if candidate.get("selected") else ""}">'
             f'<td class="mono"><strong>{_html(candidate.get("candidate_id"))}</strong></td>'
             f'<td>{_status("selected" if candidate.get("selected") else candidate.get("status"))}</td>'
-            f'<td>{_status(candidate.get("allocation_eligibility") or "eligible")}</td>'
-            f'<td class="mono">{_html(candidate.get("allocation_depth"))}</td>'
-            f'<td class="mono">{_html((candidate.get("expansion_source") or {}).get("candidate_id"))}</td>'
+            f"{adaptive_cells}"
             f'<td class="mono">{_html(_number(candidate.get("score")))}</td>'
             f'<td class="mono">{_html(_number(candidate.get("best_score")))}</td>'
-            f'<td class="mono">{_html(_number(last_node_value.get("backed_up_value")))}</td>'
             f'<td>{_html(candidate.get("process_passed"))}</td>'
             f'<td class="mono">{_html(candidate.get("iterations_total"))}</td>'
             f'<td class="mono">{_html(", ".join(candidate.get("session_ids") or []) or None)}</td>'
@@ -3819,10 +3887,17 @@ def _render_candidates(task: dict[str, Any]) -> str:
             f'<td>{_html(candidate.get("hypothesis"))}</td>'
             "</tr>"
         )
+    adaptive_headers = ""
+    if adaptive_enabled:
+        adaptive_headers = (
+            "<th>Allocation</th><th>Depth</th><th>Source</th>"
+            "<th>Backed value</th>"
+        )
     return (
         '<div class="table-scroll"><table><thead><tr>'
-        "<th>Candidate</th><th>Status</th><th>Allocation</th><th>Depth</th><th>Source</th><th>Final score</th><th>Best score</th>"
-        "<th>Backed value</th><th>Process pass</th><th>Iterations</th><th>Sessions</th><th>Changed files</th><th>Hypothesis</th>"
+        f"<th>Candidate</th><th>Status</th>{adaptive_headers}"
+        "<th>Final score</th><th>Best score</th><th>Process pass</th>"
+        "<th>Iterations</th><th>Sessions</th><th>Changed files</th><th>Hypothesis</th>"
         f'</tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
     )
 

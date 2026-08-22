@@ -71,11 +71,12 @@ decision and launches the returned session payload; it does not author a
 replacement. Reward never replaces the hard metric used by `search_select`.
 `reward_evaluation.attempt_reward` is the normalized result of the attempted
 edge, while `settled_value` is the candidate-local value after keep/retain or
-restore. Accepted settled Evidence also creates a durable `NodeValueRecord`;
-allocation ranks sources by its `backed_up_value`. V2 preserves negative
-attempt quality after a discard, while immutable `ValueBackupEvent` records
-are replayed into each ancestor node's mean, best, and backed-up value. A
-value-guided decision embeds the atomic `AllocationStateSnapshot` used for its
+restore. `SearchGraphProjection` projects settled iterations into nodes and
+transitions; `ValueProjection` holds the replayed node and edge estimates used
+by allocation. V2 preserves negative attempt quality after a discard, while
+immutable `ValueBackupEvent` records are replayed along the actual transition
+ancestry into each node's mean, best, and backed-up value. A value-guided
+decision embeds the `AllocationStateSnapshot` used for its
 lane UCB and source priority. Legacy `reward` and `state_value` fields remain
 readable but are not written by new settlements.
 Before a decision becomes visible, its triggering iteration has completed Git

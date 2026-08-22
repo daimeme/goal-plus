@@ -94,8 +94,10 @@ promotion。annotation task 注册与 reward/allocation 是互不依赖的结算
 
 Runtime 将 value layer 分为三个持久化概念：`attempt_reward` 是本次尝试的归一化即时回报，
 `metric_progress/v2` 保留退化尝试的负质量信号；`settled_value` 是结算后 candidate-local incumbent
-的绝对效用；`NodeValueRecord.backed_up_value` 是 allocation 使用的节点值。派生结果生成不可变
-`ValueBackupEvent`，runtime 重放事件得到 mean/best/backed value。`value_guided_replace/v1` 依据近期
+的绝对效用；`SearchGraphProjection` 从 settled iteration 投影 transition/node，
+`ValueProjection.node_values[].backed_up_value` 是 allocation 使用的节点值。结算结果生成不可变
+`ValueBackupEvent`，runtime 沿实际 transition 祖先链重放事件得到 mean/best/backed value。
+`value_guided_replace/v1` 依据近期
 reward 的 UCB 决定退休，并把当时全部候选与 source priority 固定进 `AllocationStateSnapshot`。
 兼容 run 仍可使用 v1 reward、identity backup 和 low-reward policy。worker 和主 agent 都不自行计算
 或改写这些值。

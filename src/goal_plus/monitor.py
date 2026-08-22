@@ -23,6 +23,7 @@ from goal_plus.models import (
 from goal_plus.paths import DEFAULT_RUNTIME_ROOT
 from goal_plus.runtime import (
     RESULTS_TSV_RELATIVE_PATH,
+    load_adaptive_search_projections,
     load_json,
     utc_timestamp,
     utc_timestamp_from_epoch,
@@ -758,6 +759,9 @@ def goal_plus_monitor_snapshot(
         frozen = FrozenSpec.model_validate(
             load_json(root / "specs" / run.frozen_spec_id / "frozen_spec.json")
         )
+        adaptive_search_enabled = (
+            frozen.spec.strategy.orchestration_mode == "adaptive_search"
+        )
         candidates = _load_candidates(run_path)
         sessions = _load_agent_sessions(run_path)
         plans = _load_plans(run_path)
@@ -825,31 +829,87 @@ def goal_plus_monitor_snapshot(
             "budget_used": run.budget_used,
             "evidence_annotations": _evidence_annotation_payload(run_path),
         }
-        decision_paths = sorted(
-            (run_path / "allocation-decisions").glob("allocation_*.json")
+        if adaptive_search_enabled:
+            decision_paths = sorted(
+                (run_path / "allocation-decisions").glob("allocation_*.json")
+            )
+            allocation_decisions = [load_json(path) for path in decision_paths]
+            run_payload["allocation_decisions"] = {
+                "total": len(allocation_decisions),
+                "pending": sum(
+                    item.get("status") == "pending"
+                    for item in allocation_decisions
+                ),
+                "applied": sum(
+                    item.get("status") == "applied"
+                    for item in allocation_decisions
+                ),
+                "items": allocation_decisions,
+            }
+            value_backup_paths = sorted(
+                (run_path / "value-backups").glob("backup_*.json")
+            )
+            value_backups = [load_json(path) for path in value_backup_paths]
+            run_payload["value_backups"] = {
+                "total": len(value_backups),
+                "target_updates": sum(
+                    len(item.get("targets") or []) for item in value_backups
+                ),
+                "items": value_backups,
+            }
+        graph, values = load_adaptive_search_projections(
+            run_path,
+            orchestration_mode=frozen.spec.strategy.orchestration_mode,
         )
-        allocation_decisions = [load_json(path) for path in decision_paths]
-        run_payload["allocation_decisions"] = {
-            "total": len(allocation_decisions),
-            "pending": sum(
-                item.get("status") == "pending" for item in allocation_decisions
-            ),
-            "applied": sum(
-                item.get("status") == "applied" for item in allocation_decisions
-            ),
-            "items": allocation_decisions,
-        }
-        value_backup_paths = sorted(
-            (run_path / "value-backups").glob("backup_*.json")
+        graph_nodes_by_id = (
+            {item.node_id: item for item in graph.nodes} if graph is not None else {}
         )
-        value_backups = [load_json(path) for path in value_backup_paths]
-        run_payload["value_backups"] = {
-            "total": len(value_backups),
-            "target_updates": sum(
-                len(item.get("targets") or []) for item in value_backups
-            ),
-            "items": value_backups,
-        }
+        values_by_node_id = (
+            {item.node_id: item for item in values.node_values}
+            if values is not None
+            else {}
+        )
+        if adaptive_search_enabled:
+            graph_path = run_path / "adaptive-search" / "search-graph.json"
+            value_path = run_path / "adaptive-search" / "value-projection.json"
+            run_payload["adaptive_search"] = {
+                "search_graph": {
+                    "path": str(graph_path),
+                    "available": graph is not None,
+                    "revision": graph.revision if graph is not None else None,
+                    "nodes_total": len(graph.nodes) if graph is not None else 0,
+                    "transitions_total": (
+                        len(graph.transitions) if graph is not None else 0
+                    ),
+                    "current_node_ids": (
+                        graph.candidate_current_node_ids if graph is not None else {}
+                    ),
+                },
+                "value_projection": {
+                    "path": str(value_path),
+                    "available": values is not None,
+                    "graph_revision": (
+                        values.graph_revision if values is not None else None
+                    ),
+                    "operator_name": (
+                        values.operator_name if values is not None else None
+                    ),
+                    "operator_version": (
+                        values.operator_version if values is not None else None
+                    ),
+                    "applied_backup_events_total": (
+                        len(values.applied_backup_event_ids)
+                        if values is not None
+                        else 0
+                    ),
+                    "node_values_total": (
+                        len(values.node_values) if values is not None else 0
+                    ),
+                    "edge_values_total": (
+                        len(values.edge_values) if values is not None else 0
+                    ),
+                },
+            }
 
         for candidate in candidates:
             candidate_sessions = sessions_by_candidate.get(candidate.candidate_id, [])
@@ -863,6 +923,13 @@ def goal_plus_monitor_snapshot(
             toolization_signal_counts: dict[str, int] = {}
             toolization_exclusion_counts: dict[str, int] = {}
             toolization_advisory_counts: dict[str, int] = {}
+            current_node_id = (
+                graph.candidate_current_node_ids.get(candidate.candidate_id)
+                if graph is not None
+                else None
+            )
+            current_node = graph_nodes_by_id.get(current_node_id or "")
+            current_value = values_by_node_id.get(current_node_id or "")
             for item in candidate.iterations:
                 status = item.shared_tool_publish_status
                 shared_status_counts[status] = shared_status_counts.get(status, 0) + 1
@@ -883,21 +950,13 @@ def goal_plus_monitor_snapshot(
                     toolization_advisory_counts[advisory] = (
                         toolization_advisory_counts.get(advisory, 0) + 1
                     )
-            candidates_payload[candidate.candidate_id] = {
+            candidate_payload = {
                 "candidate_id": candidate.candidate_id,
                 "status": candidate.status,
                 "plan_id": candidate.task.plan_id,
                 "parent_id": candidate.task.parent_id,
                 "parent_candidate_ids": candidate.task.parent_candidate_ids,
                 "base_candidate_id": candidate.task.base_candidate_id,
-                "allocation_depth": candidate.task.allocation_depth,
-                "allocation_eligibility": candidate.allocation_eligibility,
-                "retired_by_decision_id": candidate.retired_by_decision_id,
-                "expansion_source": (
-                    candidate.task.expansion_source.model_dump(mode="json")
-                    if candidate.task.expansion_source is not None
-                    else None
-                ),
                 "agent_session_count": len(candidate_sessions),
                 "process_dispatch_count": sum(
                     int(session.host_handle.metadata.get("dispatch_count") or 1)
@@ -910,37 +969,6 @@ def goal_plus_monitor_snapshot(
                 ),
                 "last_verifier_at": last_iteration.created_at if last_iteration else None,
                 "last_git_head": last_iteration.git_head if last_iteration else None,
-                "last_reward_evaluation": (
-                    last_iteration.reward_evaluation.model_dump(mode="json")
-                    if last_iteration and last_iteration.reward_evaluation is not None
-                    else None
-                ),
-                "node_value_count": len(candidate.node_values),
-                "last_node_value": (
-                    candidate.node_values[-1].model_dump(mode="json")
-                    if candidate.node_values
-                    else None
-                ),
-                "last_value_backup_event_id": (
-                    last_iteration.value_backup_event_id
-                    if last_iteration
-                    else None
-                ),
-                "last_value_backup_error": (
-                    last_iteration.value_backup_error
-                    if last_iteration
-                    else None
-                ),
-                "last_allocation_decision_id": (
-                    last_iteration.allocation_decision_id
-                    if last_iteration
-                    else None
-                ),
-                "last_allocation_decision_error": (
-                    last_iteration.allocation_decision_error
-                    if last_iteration
-                    else None
-                ),
                 "best_iteration": best_iteration.iteration if best_iteration else None,
                 "best_iteration_score": best_iteration.score if best_iteration else None,
                 "best_iteration_at": best_iteration.created_at if best_iteration else None,
@@ -988,6 +1016,58 @@ def goal_plus_monitor_snapshot(
                 "toolization_advisory_counts": toolization_advisory_counts,
                 "results_tsv": results_tsv,
             }
+            if adaptive_search_enabled:
+                candidate_payload.update({
+                    "allocation_depth": candidate.task.allocation_depth,
+                    "allocation_eligibility": candidate.allocation_eligibility,
+                    "retired_by_decision_id": candidate.retired_by_decision_id,
+                    "expansion_source": (
+                        candidate.task.expansion_source.model_dump(mode="json")
+                        if candidate.task.expansion_source is not None
+                        else None
+                    ),
+                    "last_reward_evaluation": (
+                        last_iteration.reward_evaluation.model_dump(mode="json")
+                        if last_iteration
+                        and last_iteration.reward_evaluation is not None
+                        else None
+                    ),
+                    "search_node_count": sum(
+                        item.candidate_id == candidate.candidate_id
+                        for item in (graph.nodes if graph is not None else [])
+                    ),
+                    "current_search_node": (
+                        current_node.model_dump(mode="json")
+                        if current_node is not None
+                        else None
+                    ),
+                    "current_value_estimate": (
+                        current_value.model_dump(mode="json")
+                        if current_value is not None
+                        else None
+                    ),
+                    "last_value_backup_event_id": (
+                        last_iteration.value_backup_event_id
+                        if last_iteration
+                        else None
+                    ),
+                    "last_value_backup_error": (
+                        last_iteration.value_backup_error
+                        if last_iteration
+                        else None
+                    ),
+                    "last_allocation_decision_id": (
+                        last_iteration.allocation_decision_id
+                        if last_iteration
+                        else None
+                    ),
+                    "last_allocation_decision_error": (
+                        last_iteration.allocation_decision_error
+                        if last_iteration
+                        else None
+                    ),
+                })
+            candidates_payload[candidate.candidate_id] = candidate_payload
             if not candidate_sessions and candidate.status == "created":
                 warnings.append(
                     {

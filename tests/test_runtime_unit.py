@@ -18,6 +18,8 @@ from goal_plus.models import (
     ScoreReport,
     SearchSpec,
 )
+from goal_plus.monitor import goal_plus_monitor_snapshot
+from goal_plus.reporting import build_html_report_data, render_html_report
 from goal_plus.runtime import (
     FileSearchRuntime,
     VERIFIER_OUTPUT_LIMIT_BYTES,
@@ -2154,7 +2156,20 @@ def test_parallel_loops_rejects_second_plan_and_reuses_initial_candidates(
     assert record.iterations[-1].reward_evaluation is None
     assert record.iterations[-1].value_backup_event_id is None
     assert record.iterations[-1].allocation_decision_id is None
-    assert record.node_values == []
+    assert runtime._load_search_graph_projection(run_id) is None
+    assert runtime._load_value_projection(run_id) is None
+
+    snapshot = goal_plus_monitor_snapshot(runtime.root_dir, run_id=run_id)
+    assert "adaptive_search" not in snapshot["run"]
+    assert "allocation_decisions" not in snapshot["run"]
+    assert "current_value_estimate" not in snapshot["candidates"][tasks[0].candidate_id]
+
+    report_data = build_html_report_data(runtime.root_dir, run_id)
+    [task_report] = report_data["search_tasks"]
+    assert "allocation_decisions" not in task_report
+    assert "search_graph" not in task_report
+    assert "current_value_estimate" not in task_report["candidates"][0]
+    assert "Reward / allocation" not in render_html_report(report_data)
 
     continued = runtime.continue_agent_session(session.agent_session_id)
     assert continued.agent_session_id == session.agent_session_id

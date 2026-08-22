@@ -143,8 +143,10 @@ value-guided 组合为
 runtime 在 verifier 结算后隔离计算 reward，并持久化 retire/expand decision；Pi supervisor
 不计算 reward、不选择 candidate，也不自动 refill。
 其中 `attempt_reward` 表示本次尝试增量，`settled_value` 表示回滚/保留后的 incumbent 效用，
-`NodeValueRecord.backed_up_value` 是 allocation 的派生来源值。runtime 通过不可变 backup event
-重放 mean/best/backed value，并把 lane UCB 与 source priority 固定在 decision snapshot 中。
+`SearchGraphProjection` 从 settled iteration 投影 transition/node，
+`ValueProjection.node_values[].backed_up_value` 是 allocation 的派生来源值。runtime 通过不可变
+backup event 沿实际 transition 祖先链重放 mean/best/backed value，并把 lane UCB 与 source
+priority 固定在 decision snapshot 中。
 Pi worker 和 supervisor 都不计算或改写这些值。
 decision 对外可见前，触发 iteration 的 Git/results ledger 已结算。annotation task 注册与
 reward/allocation 互不作为前置条件，缺失 task 会从已持久化 iteration 幂等补齐。

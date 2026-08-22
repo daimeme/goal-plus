@@ -34,16 +34,12 @@ from goal_plus.agent_hosts import (
     portable_strategy_mode,
 )
 from goal_plus.adaptive_search import (
+    AdaptiveSearchEngine,
     AllocationContext,
+    AllocationResourceState,
     RewardContext,
     ValueBackupContext,
     allocation_config_hash,
-    create_value_backup_event,
-    decide_allocation,
-    evaluate_reward,
-    materialize_node_values,
-    replay_value_backups,
-    validate_adaptive_search_spec,
 )
 from goal_plus.models import (
     AllocationAction,
@@ -74,6 +70,7 @@ from goal_plus.models import (
     ResolvedCodexProvider,
     ResolvedEvidenceAnnotatorProfile,
     ScoreReport,
+    SearchGraphProjection,
     SearchPlan,
     SearchSpec,
     SharedToolRecord,
@@ -86,6 +83,7 @@ from goal_plus.models import (
     VerifierResult,
     VerifierRole,
     ValueBackupEvent,
+    ValueProjection,
     WorkerBudget,
     WorkerLaunchOptions,
 )
@@ -301,6 +299,29 @@ def write_text(path: Path, text: str) -> None:
     tmp_path.replace(path)
 
 
+def load_adaptive_search_projections(
+    run_dir: Path,
+    *,
+    orchestration_mode: str,
+) -> tuple[SearchGraphProjection | None, ValueProjection | None]:
+    if orchestration_mode != "adaptive_search":
+        return None, None
+    projection_dir = run_dir / "adaptive-search"
+    graph_path = projection_dir / "search-graph.json"
+    value_path = projection_dir / "value-projection.json"
+    graph = (
+        SearchGraphProjection.model_validate(load_json(graph_path))
+        if graph_path.exists()
+        else None
+    )
+    values = (
+        ValueProjection.model_validate(load_json(value_path))
+        if value_path.exists()
+        else None
+    )
+    return graph, values
+
+
 @contextmanager
 def exclusive_file_lock(lock_path: Path):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -401,6 +422,7 @@ class FileSearchRuntime:
         self.root_dir = Path(root_dir).resolve()
         self.specs_dir = self.root_dir / "specs"
         self.runs_dir = self.root_dir / "runs"
+        self._adaptive_search = AdaptiveSearchEngine()
         self.specs_dir.mkdir(parents=True, exist_ok=True)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1249,6 +1271,23 @@ class FileSearchRuntime:
                 run.candidates_total,
                 len(self._load_candidate_records(run_id)),
             )
+            records = self._load_candidate_records(run_id)
+            adaptive_spec = frozen.spec.strategy.adaptive_search
+            if adaptive_spec is None:  # pragma: no cover - guarded by the mode
+                raise RuntimeError("adaptive_search configuration is unavailable")
+            graph = self._adaptive_search.project(
+                run_id,
+                records,
+                created_at=utc_timestamp(),
+            )
+            values = self._adaptive_search.replay_values(
+                adaptive_spec,
+                graph,
+                records,
+                self._load_value_backup_events(run_id),
+            )
+            self._write_search_graph_projection(graph)
+            self._write_value_projection(values)
             self._write_run(run)
 
         sessions: list[AgentSessionRecord] = []
@@ -1314,31 +1353,41 @@ class FileSearchRuntime:
         )
         if existing is not None:
             iteration.allocation_decision_id = existing.decision_id
+            record.allocation_eligibility = "retired"
+            record.retired_by_decision_id = existing.decision_id
             return existing
 
-        persisted_records = self._load_candidate_records(run.run_id)
+        graph = self._load_search_graph_projection(run.run_id)
+        values = self._load_value_projection(run.run_id)
+        if graph is None or values is None:
+            return None
+        records = self._load_candidate_records(run.run_id)
         records = [
             record if item.candidate_id == record.candidate_id else item
-            for item in persisted_records
+            for item in records
         ]
-        if not any(item.candidate_id == record.candidate_id for item in records):
-            records.append(record)
+        decisions = self._load_allocation_decisions(run.run_id)
         pending_expansions = sum(
             action.kind == "expand_candidate"
-            for decision in self._load_allocation_decisions(run.run_id)
+            for decision in decisions
             if decision.status == "pending"
             for action in decision.actions
         )
         max_candidates = frozen.spec.budget.max_candidates
-        if max_candidates is None:
+        if max_candidates is None:  # pragma: no cover - validated by SearchSpec
             return None
-        recommendation = decide_allocation(
+        recommendation = self._adaptive_search.decide(
             AllocationContext(
                 adaptive_spec=adaptive_spec,
                 trigger_record=record,
                 records=records,
-                pending_expansions=pending_expansions,
-                max_candidates=max_candidates,
+                graph=graph,
+                values=values,
+                resources=AllocationResourceState(
+                    materialized_candidates=len(records),
+                    pending_expansions=pending_expansions,
+                    max_candidates=max_candidates,
+                ),
             )
         )
         if recommendation is None:
@@ -1396,42 +1445,38 @@ class FileSearchRuntime:
     ) -> ValueBackupEvent | None:
         adaptive_spec = frozen.spec.strategy.adaptive_search
         reward = iteration.reward_evaluation
-        if adaptive_spec is None or reward is None or reward.status != "evaluated":
-            return None
+        if adaptive_spec is None or reward is None:
+            raise RuntimeError("adaptive settlement requires a reward result")
 
-        persisted_records = self._load_candidate_records(run.run_id)
+        records = self._load_candidate_records(run.run_id)
         records = [
             record if item.candidate_id == record.candidate_id else item
-            for item in persisted_records
+            for item in records
         ]
-        if not any(item.candidate_id == record.candidate_id for item in records):
-            records.append(record)
-        for item in records:
-            item.node_values = materialize_node_values(item, adaptive_spec)
-
-        event = create_value_backup_event(
+        graph = self._adaptive_search.project(
+            run.run_id,
+            records,
+            created_at=iteration.created_at,
+        )
+        events = self._load_value_backup_events(run.run_id)
+        event, values = self._adaptive_search.settle_values(
             adaptive_spec,
             ValueBackupContext(
                 run_id=run.run_id,
                 trigger_record=record,
                 records=records,
+                graph=graph,
                 reward=reward,
                 created_at=iteration.created_at,
             ),
+            events,
         )
-        events = self._load_value_backup_events(run.run_id)
         if event is not None and not any(
             item.event_id == event.event_id for item in events
         ):
             self._write_value_backup_event(event)
-            events.append(event)
-
-        replay_value_backups(adaptive_spec, records, events)
-        for item in records:
-            if item.candidate_id == record.candidate_id:
-                record.node_values = item.node_values
-            else:
-                self._write_candidate_record(run.run_id, item)
+        self._write_search_graph_projection(graph)
+        self._write_value_projection(values)
         return event
 
     def plan_next(self, run_id: str, requested_k: int = 4) -> SearchPlan:
@@ -2877,7 +2922,7 @@ class FileSearchRuntime:
                     and math.isfinite(float(elapsed))
                     and float(elapsed) >= 0
                 )
-                reward = evaluate_reward(
+                reward = self._adaptive_search.evaluate_reward(
                     adaptive_spec,
                     RewardContext(
                         candidate_id=candidate_id,
@@ -2894,8 +2939,9 @@ class FileSearchRuntime:
                 )
                 iteration.reward_evaluation = reward
             record.iterations.append(iteration)
+            # Persist the settlement before writing its derived projections.
+            self._write_candidate_record(run_id, record)
             if adaptive_spec is not None:
-                record.node_values = materialize_node_values(record, adaptive_spec)
                 try:
                     backup_event = self._settle_value_backups_locked(
                         run,
@@ -2907,7 +2953,11 @@ class FileSearchRuntime:
                         iteration.value_backup_event_id = backup_event.event_id
                 except Exception as exc:
                     iteration.value_backup_error = f"{type(exc).__name__}: {exc}"
-            if adaptive_spec is not None and agent_session_id is not None:
+            if (
+                adaptive_spec is not None
+                and agent_session_id is not None
+                and iteration.value_backup_error is None
+            ):
                 try:
                     allocation_decision = self._create_allocation_decision_locked(
                         run,
@@ -3574,8 +3624,7 @@ class FileSearchRuntime:
         strategy = spec.strategy.model_copy(update={"config": config})
         return spec.model_copy(update={"strategy": strategy})
 
-    @staticmethod
-    def _validate_strategy_config(strategy: StrategySpec) -> None:
+    def _validate_strategy_config(self, strategy: StrategySpec) -> None:
         evidence_mode = strategy.config.get("global_evidence_mode", "manual")
         if evidence_mode not in GLOBAL_EVIDENCE_MODES:
             allowed = ", ".join(sorted(GLOBAL_EVIDENCE_MODES))
@@ -3593,7 +3642,7 @@ class FileSearchRuntime:
                 f"{', '.join(misplaced)}; place them in strategy.worker_budget"
             )
         if strategy.adaptive_search is not None:
-            validate_adaptive_search_spec(strategy.adaptive_search)
+            self._adaptive_search.validate_spec(strategy.adaptive_search)
 
     def _validate_worker_launch_for_host(self, strategy: StrategySpec) -> None:
         self._validate_worker_launch_options_for_host(
@@ -7291,6 +7340,39 @@ class FileSearchRuntime:
 
     def _value_backup_dir(self, run_id: str) -> Path:
         return self._run_dir(run_id) / "value-backups"
+
+    def _adaptive_search_dir(self, run_id: str) -> Path:
+        return self._run_dir(run_id) / "adaptive-search"
+
+    def _load_search_graph_projection(
+        self,
+        run_id: str,
+    ) -> SearchGraphProjection | None:
+        path = self._adaptive_search_dir(run_id) / "search-graph.json"
+        if not path.exists():
+            return None
+        return SearchGraphProjection.model_validate(load_json(path))
+
+    def _write_search_graph_projection(
+        self,
+        graph: SearchGraphProjection,
+    ) -> None:
+        write_json(
+            self._adaptive_search_dir(graph.run_id) / "search-graph.json",
+            graph.model_dump(mode="json"),
+        )
+
+    def _load_value_projection(self, run_id: str) -> ValueProjection | None:
+        path = self._adaptive_search_dir(run_id) / "value-projection.json"
+        if not path.exists():
+            return None
+        return ValueProjection.model_validate(load_json(path))
+
+    def _write_value_projection(self, values: ValueProjection) -> None:
+        write_json(
+            self._adaptive_search_dir(values.run_id) / "value-projection.json",
+            values.model_dump(mode="json"),
+        )
 
     def _load_value_backup_events(self, run_id: str) -> list[ValueBackupEvent]:
         directory = self._value_backup_dir(run_id)

@@ -953,26 +953,206 @@ class RewardEvaluation(SearchModel):
         return self.settled_value
 
 
-class NodeValueRecord(SearchModel):
+SearchNodeKind = Literal["virtual_root", "settled_iteration"]
+SearchTransitionKind = Literal[
+    "initial_attempt", "candidate_continuation", "derived_candidate_start"
+]
+
+
+class SearchNodeRecord(SearchModel):
     schema_version: Literal[1] = 1
     node_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    kind: SearchNodeKind
+    candidate_id: str = Field(min_length=1)
+    iteration: int | None = Field(default=None, ge=1)
+    parent_node_id: str | None = None
+    incoming_transition_id: str | None = None
+    evidence_commit: str | None = None
+    settled_commit: str = Field(min_length=1)
+    artifact_hash: str | None = None
+    score: float | None = Field(default=None, allow_inf_nan=False)
+    reward_id: str | None = None
+    settled_value: float | None = Field(default=None, allow_inf_nan=False)
+    transition_depth: int = Field(ge=0)
+    allocation_depth: int = Field(ge=0)
+    created_at: str
+
+    @model_validator(mode="after")
+    def kind_matches_iteration(self) -> "SearchNodeRecord":
+        if self.kind == "virtual_root":
+            if self.iteration is not None or self.parent_node_id is not None:
+                raise ValueError("virtual root nodes cannot have an iteration or parent")
+            if self.incoming_transition_id is not None:
+                raise ValueError("virtual root nodes cannot have an incoming transition")
+        elif (
+            self.iteration is None
+            or self.parent_node_id is None
+            or self.incoming_transition_id is None
+            or self.evidence_commit is None
+            or self.artifact_hash is None
+            or self.score is None
+            or self.reward_id is None
+        ):
+            raise ValueError(
+                "settled iteration nodes require iteration, parent, incoming "
+                "transition, evidence, score, artifact, and reward"
+            )
+        return self
+
+
+class SearchTransitionRecord(SearchModel):
+    schema_version: Literal[1] = 1
+    transition_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
     candidate_id: str = Field(min_length=1)
     iteration: int = Field(ge=1)
-    evidence_commit: str = Field(min_length=1)
-    reward_id: str = Field(min_length=1)
-    settled_value: float = Field(allow_inf_nan=False)
-    backed_up_value: float = Field(allow_inf_nan=False)
-    backup_operator_name: str = Field(default="identity", min_length=1)
-    backup_operator_version: int = Field(default=1, ge=1)
-    backup_config_hash: str | None = Field(
-        default=None,
-        pattern=r"^[0-9a-f]{64}$",
-    )
-    backup_count: int = Field(default=0, ge=0)
-    backup_mean_return: float | None = Field(default=None, allow_inf_nan=False)
-    backup_best_return: float | None = Field(default=None, allow_inf_nan=False)
+    kind: SearchTransitionKind
+    from_node_id: str = Field(min_length=1)
+    accepted_node_id: str | None = None
+    settled_node_id: str = Field(min_length=1)
+    attempt_base_commit: str | None = None
+    attempt_commit: str | None = None
+    settled_commit: str | None = None
+    disposition: IterationDisposition
+    process_passed: bool
+    score: float | None = Field(default=None, allow_inf_nan=False)
+    reward_id: str | None = None
+    attempt_reward: float | None = Field(default=None, allow_inf_nan=False)
+    created_at: str
+
+    @model_validator(mode="after")
+    def settlement_matches_disposition(self) -> "SearchTransitionRecord":
+        if self.disposition in {"keep", "retain"}:
+            if not self.process_passed:
+                raise ValueError("accepted transitions require process success")
+            if self.accepted_node_id is None:
+                raise ValueError("accepted transitions require an accepted node")
+            if self.settled_node_id != self.accepted_node_id:
+                raise ValueError("accepted transitions must settle on the accepted node")
+        else:
+            if self.accepted_node_id is not None:
+                raise ValueError("discarded or failed transitions cannot create a node")
+            if self.settled_node_id != self.from_node_id:
+                raise ValueError("discarded or failed transitions settle on their source")
+        if self.disposition == "failure" and self.process_passed:
+            raise ValueError("failure transitions cannot pass process verification")
+        return self
+
+
+class SearchGraphProjection(SearchModel):
+    schema_version: Literal[1] = 1
+    run_id: str = Field(min_length=1)
+    revision: int = Field(ge=0)
+    nodes: list[SearchNodeRecord] = Field(default_factory=list)
+    transitions: list[SearchTransitionRecord] = Field(default_factory=list)
+    candidate_current_node_ids: dict[str, str] = Field(default_factory=dict)
     created_at: str
     updated_at: str
+
+    @model_validator(mode="after")
+    def references_are_consistent(self) -> "SearchGraphProjection":
+        node_ids = [item.node_id for item in self.nodes]
+        transition_ids = [item.transition_id for item in self.transitions]
+        expected_revision = len(self.transitions) + len(
+            self.candidate_current_node_ids
+        )
+        if self.revision != expected_revision:
+            raise ValueError(
+                "search graph revision must equal candidate and transition fact count"
+            )
+        if len(node_ids) != len(set(node_ids)):
+            raise ValueError("search graph node ids must be unique")
+        if len(transition_ids) != len(set(transition_ids)):
+            raise ValueError("search graph transition ids must be unique")
+        transition_coordinates = [
+            (item.candidate_id, item.iteration) for item in self.transitions
+        ]
+        if len(transition_coordinates) != len(set(transition_coordinates)):
+            raise ValueError("candidate iteration transitions must be unique")
+        known_nodes = set(node_ids)
+        transitions_by_id = {
+            item.transition_id: item for item in self.transitions
+        }
+        for node in self.nodes:
+            if node.run_id != self.run_id:
+                raise ValueError("search graph node belongs to another run")
+            if node.parent_node_id is not None and node.parent_node_id not in known_nodes:
+                raise ValueError("search graph node parent is unavailable")
+            if node.incoming_transition_id is not None:
+                incoming = transitions_by_id.get(node.incoming_transition_id)
+                if incoming is None or incoming.accepted_node_id != node.node_id:
+                    raise ValueError("search graph node incoming transition is invalid")
+        for transition in self.transitions:
+            if transition.run_id != self.run_id:
+                raise ValueError("search graph transition belongs to another run")
+            references = {
+                transition.from_node_id,
+                transition.settled_node_id,
+            }
+            if transition.accepted_node_id is not None:
+                references.add(transition.accepted_node_id)
+            if not references.issubset(known_nodes):
+                raise ValueError("search graph transition references an unavailable node")
+        if not set(self.candidate_current_node_ids.values()).issubset(known_nodes):
+            raise ValueError("candidate current node is unavailable")
+        return self
+
+
+class NodeValueEstimate(SearchModel):
+    node_id: str = Field(min_length=1)
+    settled_value: float | None = Field(default=None, allow_inf_nan=False)
+    expected_gain: float | None = Field(default=None, allow_inf_nan=False)
+    backed_up_value: float | None = Field(default=None, allow_inf_nan=False)
+    direct_attempt_count: int = Field(default=0, ge=0)
+    observation_count: int = Field(default=0, ge=0)
+    unique_branch_count: int = Field(default=0, ge=0)
+    completed_expansion_count: int = Field(default=0, ge=0)
+    unobserved_expansion_count: int = Field(default=0, ge=0)
+    backup_count: int = Field(default=0, ge=0)
+    backup_mean_return: float | None = Field(default=None, allow_inf_nan=False)
+    backup_return_m2: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    backup_best_return: float | None = Field(default=None, allow_inf_nan=False)
+    total_cost: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    uncertainty: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    updated_at: str
+
+
+class EdgeValueEstimate(SearchModel):
+    transition_id: str = Field(min_length=1)
+    from_node_id: str = Field(min_length=1)
+    settled_node_id: str = Field(min_length=1)
+    attempt_reward: float | None = Field(default=None, allow_inf_nan=False)
+    observed_return: float | None = Field(default=None, allow_inf_nan=False)
+    created_at: str
+
+
+class ValueProjection(SearchModel):
+    schema_version: Literal[1] = 1
+    run_id: str = Field(min_length=1)
+    graph_revision: int = Field(ge=0)
+    operator_name: str = Field(min_length=1)
+    operator_version: int = Field(ge=1)
+    config_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    applied_backup_event_ids: list[str] = Field(default_factory=list)
+    node_values: list[NodeValueEstimate] = Field(default_factory=list)
+    edge_values: list[EdgeValueEstimate] = Field(default_factory=list)
+    created_at: str
+    updated_at: str
+
+    @model_validator(mode="after")
+    def estimate_ids_are_unique(self) -> "ValueProjection":
+        node_ids = [item.node_id for item in self.node_values]
+        transition_ids = [item.transition_id for item in self.edge_values]
+        if len(self.applied_backup_event_ids) != len(
+            set(self.applied_backup_event_ids)
+        ):
+            raise ValueError("applied backup event ids must be unique")
+        if len(node_ids) != len(set(node_ids)):
+            raise ValueError("node value estimate ids must be unique")
+        if len(transition_ids) != len(set(transition_ids)):
+            raise ValueError("edge value estimate ids must be unique")
+        return self
 
 
 class ExpansionSource(SearchModel):
@@ -1486,10 +1666,6 @@ class CandidateRecord(SearchModel):
     promotion_evidence: PromotionEvidence | None = None
     pending_tool_copies: list[ToolCopyReceipt] = Field(default_factory=list, exclude_if=lambda value: not value)
     iterations: list[IterationRecord] = Field(default_factory=list)
-    node_values: list[NodeValueRecord] = Field(
-        default_factory=list,
-        exclude_if=lambda value: not value,
-    )
     results_ledger: list[ResultLedgerEntry] = Field(default_factory=list)
     results_ledger_git_head: str | None = None
 

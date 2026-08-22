@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import math
@@ -13,11 +13,16 @@ from goal_plus.models import (
     AllocationSourceSnapshot,
     AllocationStateSnapshot,
     CandidateRecord,
+    EdgeValueEstimate,
     ExpansionSource,
     IterationRecord,
-    NodeValueRecord,
+    NodeValueEstimate,
     RewardEvaluation,
+    SearchGraphProjection,
     SearchModel,
+    SearchNodeRecord,
+    SearchTransitionRecord,
+    ValueProjection,
     ValueBackupEvent,
     ValueBackupTarget,
 )
@@ -94,8 +99,31 @@ class AllocationContext:
     adaptive_spec: AdaptiveSearchSpec
     trigger_record: CandidateRecord
     records: list[CandidateRecord]
+    graph: SearchGraphProjection
+    values: ValueProjection
+    resources: "AllocationResourceState"
+
+
+@dataclass(frozen=True)
+class AllocationResourceState:
+    """Observed capacity plus reserved fields for later search control."""
+
+    materialized_candidates: int
     pending_expansions: int
     max_candidates: int
+    frontier_width: int | None = None
+    max_frontier_width: int | None = None
+    unobserved_expansions_by_node: dict[str, int] = field(default_factory=dict)
+    exploration_quota_remaining_by_node: dict[str, int] = field(
+        default_factory=dict
+    )
+
+
+@dataclass(frozen=True)
+class AllocationReservationPlan:
+    """Reserved contract for future atomic allocation."""
+
+    reservation_keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -111,6 +139,7 @@ class ValueBackupContext:
     run_id: str
     trigger_record: CandidateRecord
     records: list[CandidateRecord]
+    graph: SearchGraphProjection
     reward: RewardEvaluation
     created_at: str
 
@@ -119,6 +148,21 @@ class ValueBackupContext:
 class _SourceOption:
     source: ExpansionSource
     snapshot: AllocationSourceSnapshot
+
+
+def _replacement_recommendation(
+    context: AllocationContext,
+    *,
+    source: ExpansionSource,
+    reason: str,
+    state_snapshot: AllocationStateSnapshot | None = None,
+) -> AllocationRecommendation:
+    return AllocationRecommendation(
+        retire_candidate_id=context.trigger_record.candidate_id,
+        source=source,
+        reason=reason,
+        state_snapshot=state_snapshot,
+    )
 
 
 class RewardEvaluator(Protocol):
@@ -165,12 +209,33 @@ class ValueBackupOperator(Protocol):
 
     def replay(
         self,
+        graph: SearchGraphProjection,
         records: list[CandidateRecord],
         events: list[ValueBackupEvent],
         params: dict[str, object],
         *,
         config_hash: str,
-    ) -> list[CandidateRecord]: ...
+    ) -> ValueProjection: ...
+
+
+class AllocationConstraintEvaluator(Protocol):
+    """Extension point for width, quota, and other admission constraints."""
+
+    def validate(
+        self,
+        context: AllocationContext,
+        recommendation: AllocationRecommendation,
+    ) -> None: ...
+
+
+class AllocationReservationPlanner(Protocol):
+    """Extension point for a future atomic allocation decision."""
+
+    def plan(
+        self,
+        context: AllocationContext,
+        recommendation: AllocationRecommendation,
+    ) -> AllocationReservationPlan: ...
 
 
 class MetricProgressRewardEvaluator:
@@ -392,17 +457,23 @@ class LowRewardReplacePolicy:
             for item in recent
         ):
             return None
-        if len(context.records) + context.pending_expansions >= context.max_candidates:
+        if (
+            context.resources.materialized_candidates
+            + context.resources.pending_expansions
+            >= context.resources.max_candidates
+        ):
             return None
 
         source = _highest_value_source(
+            context.graph,
+            context.values,
             context.records,
             max_depth=context.adaptive_spec.expansion.max_depth,
         )
         if source is None:
             return None
-        return AllocationRecommendation(
-            retire_candidate_id=record.candidate_id,
+        return _replacement_recommendation(
+            context,
             source=source,
             reason=(
                 f"{config.consecutive_below} consecutive rewards were <= "
@@ -464,6 +535,8 @@ class ValueGuidedReplacePolicy:
             recent_rewards
         )
         source_options = _source_options(
+            context.graph,
+            context.values,
             context.records,
             max_depth=context.adaptive_spec.expansion.max_depth,
             exploration_weight=config.source_exploration_weight,
@@ -480,17 +553,18 @@ class ValueGuidedReplacePolicy:
             lane_exploration_bonus=exploration_bonus,
             lane_upper_confidence_bound=upper_bound,
             nonpositive_fraction=nonpositive,
-            materialized_candidates=len(context.records),
-            pending_expansions=context.pending_expansions,
-            max_candidates=context.max_candidates,
+            materialized_candidates=context.resources.materialized_candidates,
+            pending_expansions=context.resources.pending_expansions,
+            max_candidates=context.resources.max_candidates,
             source_options=[item.snapshot for item in source_options],
             created_at=record.iterations[-1].created_at,
         )
         if (
             nonpositive < config.nonpositive_fraction
             or upper_bound > config.retire_threshold
-            or len(context.records) + context.pending_expansions
-            >= context.max_candidates
+            or context.resources.materialized_candidates
+            + context.resources.pending_expansions
+            >= context.resources.max_candidates
         ):
             return None
         source = next(
@@ -499,8 +573,8 @@ class ValueGuidedReplacePolicy:
         )
         if source is None:
             return None
-        return AllocationRecommendation(
-            retire_candidate_id=record.candidate_id,
+        return _replacement_recommendation(
+            context,
             source=source,
             reason=(
                 f"lane upper confidence bound {upper_bound:.6g} was <= "
@@ -530,15 +604,25 @@ class IdentityValueBackupOperator:
 
     def replay(
         self,
+        graph: SearchGraphProjection,
         records: list[CandidateRecord],
         events: list[ValueBackupEvent],
         params: dict[str, object],
         *,
         config_hash: str,
-    ) -> list[CandidateRecord]:
+    ) -> ValueProjection:
         IdentityValueBackupParams.model_validate(params)
-        _reset_node_values(records, self.name, self.version, config_hash)
-        return records
+        projection = _initial_value_projection(
+            graph,
+            records,
+            operator_name=self.name,
+            operator_version=self.version,
+            config_hash=config_hash,
+        )
+        nodes = {item.node_id: item for item in graph.nodes}
+        for edge in projection.edge_values:
+            edge.observed_return = nodes[edge.settled_node_id].settled_value
+        return projection
 
 
 class DiscountedMeanBestBackupOperator:
@@ -557,49 +641,53 @@ class DiscountedMeanBestBackupOperator:
     ) -> ValueBackupEvent | None:
         config = DiscountedMeanBestBackupParams.model_validate(params)
         reward = context.reward
-        source = context.trigger_record.task.expansion_source
         if (
-            source is None
-            or reward.status != "evaluated"
+            reward.status != "evaluated"
             or reward.attempt_reward is None
             or reward.settled_value is None
         ):
             return None
 
-        records_by_id = {item.candidate_id: item for item in context.records}
+        source_iteration = context.trigger_record.iterations[-1].iteration
+        transition = next(
+            (
+                item
+                for item in context.graph.transitions
+                if item.candidate_id == context.trigger_record.candidate_id
+                and item.iteration == source_iteration
+            ),
+            None,
+        )
+        if transition is None:
+            return None
+
+        nodes = {item.node_id: item for item in context.graph.nodes}
         observed_value = (
             reward.settled_value
             + config.attempt_reward_weight * reward.attempt_reward
         )
         targets: list[ValueBackupTarget] = []
         seen_nodes: set[str] = set()
+        source_node_id: str | None = transition.from_node_id
         distance = 1
-        while source is not None and source.node_id not in seen_nodes:
-            seen_nodes.add(source.node_id)
-            source_record = records_by_id.get(source.candidate_id)
-            if source_record is None:
-                break
-            node = next(
-                (
-                    item for item in source_record.node_values
-                    if item.node_id == source.node_id
-                ),
-                None,
-            )
+        while source_node_id is not None and source_node_id not in seen_nodes:
+            seen_nodes.add(source_node_id)
+            node = nodes.get(source_node_id)
             if node is None:
                 break
-            discounted_return = node.settled_value + (
-                config.discount ** (distance - 1)
-            ) * (observed_value - node.settled_value)
-            targets.append(
-                ValueBackupTarget(
-                    candidate_id=source_record.candidate_id,
-                    node_id=node.node_id,
-                    distance=distance,
-                    return_value=discounted_return,
+            if node.settled_value is not None:
+                discounted_return = node.settled_value + (
+                    config.discount ** (distance - 1)
+                ) * (observed_value - node.settled_value)
+                targets.append(
+                    ValueBackupTarget(
+                        candidate_id=node.candidate_id,
+                        node_id=node.node_id,
+                        distance=distance,
+                        return_value=discounted_return,
+                    )
                 )
-            )
-            source = source_record.task.expansion_source
+            source_node_id = node.parent_node_id
             distance += 1
         if not targets:
             return None
@@ -615,11 +703,11 @@ class DiscountedMeanBestBackupOperator:
         return ValueBackupEvent(
             event_id=(
                 f"backup_{context.trigger_record.candidate_id}_"
-                f"{context.trigger_record.iterations[-1].iteration:04d}_{digest}"
+                f"{source_iteration:04d}_{digest}"
             ),
             run_id=context.run_id,
             source_candidate_id=context.trigger_record.candidate_id,
-            source_iteration=context.trigger_record.iterations[-1].iteration,
+            source_iteration=source_iteration,
             source_reward_id=reward.reward_id,
             operator_name=self.name,
             operator_version=self.version,
@@ -632,20 +720,35 @@ class DiscountedMeanBestBackupOperator:
 
     def replay(
         self,
+        graph: SearchGraphProjection,
         records: list[CandidateRecord],
         events: list[ValueBackupEvent],
         params: dict[str, object],
         *,
         config_hash: str,
-    ) -> list[CandidateRecord]:
+    ) -> ValueProjection:
         config = DiscountedMeanBestBackupParams.model_validate(params)
-        _reset_node_values(records, self.name, self.version, config_hash)
-        nodes = {
-            node.node_id: node
-            for record in records
-            for node in record.node_values
+        projection = _initial_value_projection(
+            graph,
+            records,
+            operator_name=self.name,
+            operator_version=self.version,
+            config_hash=config_hash,
+        )
+        nodes = {item.node_id: item for item in projection.node_values}
+        edges = {item.transition_id: item for item in projection.edge_values}
+        graph_nodes = {item.node_id: item for item in graph.nodes}
+        transitions = {
+            (item.candidate_id, item.iteration): item
+            for item in graph.transitions
         }
-        last_updated: dict[str, str] = {}
+        for transition in graph.transitions:
+            settled_value = graph_nodes[transition.settled_node_id].settled_value
+            if settled_value is not None and transition.attempt_reward is not None:
+                edges[transition.transition_id].observed_return = (
+                    settled_value
+                    + config.attempt_reward_weight * transition.attempt_reward
+                )
         for event in sorted(events, key=lambda item: (item.created_at, item.event_id)):
             if (
                 event.operator_name != self.name
@@ -653,17 +756,44 @@ class DiscountedMeanBestBackupOperator:
                 or event.config_hash != config_hash
             ):
                 continue
+            transition = transitions.get(
+                (event.source_candidate_id, event.source_iteration)
+            )
+            if transition is None:
+                raise ValueError(
+                    f"backup event source transition is unavailable: {event.event_id}"
+                )
+            edges[transition.transition_id].observed_return = (
+                event.settled_value
+                + config.attempt_reward_weight * event.attempt_reward
+            )
             for target in event.targets:
                 node = nodes.get(target.node_id)
                 if node is None:
-                    continue
+                    raise ValueError(
+                        f"backup event target node is unavailable: {target.node_id}"
+                    )
+                if node.settled_value is None:
+                    raise ValueError(
+                        f"backup event target has no settled value: {target.node_id}"
+                    )
+                if graph_nodes[target.node_id].candidate_id != target.candidate_id:
+                    raise ValueError(
+                        f"backup event target candidate mismatch: {target.node_id}"
+                    )
                 count = node.backup_count + 1
-                mean_return = (
-                    target.return_value
-                    if node.backup_mean_return is None
-                    else node.backup_mean_return
-                    + (target.return_value - node.backup_mean_return) / count
-                )
+                previous_mean = node.backup_mean_return
+                if previous_mean is None:
+                    mean_return = target.return_value
+                    return_m2 = 0.0
+                else:
+                    delta = target.return_value - previous_mean
+                    mean_return = previous_mean + delta / count
+                    return_m2 = max(
+                        0.0,
+                        node.backup_return_m2
+                        + delta * (target.return_value - mean_return),
+                    )
                 best_return = (
                     target.return_value
                     if node.backup_best_return is None
@@ -674,16 +804,24 @@ class DiscountedMeanBestBackupOperator:
                 ) / (count + 1)
                 best_with_self = max(node.settled_value, best_return)
                 node.backup_count = count
+                node.observation_count = count
                 node.backup_mean_return = mean_return
+                node.backup_return_m2 = return_m2
                 node.backup_best_return = best_return
+                node.expected_gain = mean_return - node.settled_value
                 node.backed_up_value = (
                     (1.0 - config.best_weight) * mean_with_self
                     + config.best_weight * best_with_self
                 )
-                last_updated[node.node_id] = event.created_at
-        for node_id, updated_at in last_updated.items():
-            nodes[node_id].updated_at = updated_at
-        return records
+                node.uncertainty = (
+                    math.sqrt(return_m2 / (count - 1)) / math.sqrt(count)
+                    if count > 1
+                    else None
+                )
+                node.updated_at = event.created_at
+                projection.updated_at = max(projection.updated_at, event.created_at)
+            projection.applied_backup_event_ids.append(event.event_id)
+        return projection
 
 
 _REWARD_EVALUATORS: dict[tuple[str, int], RewardEvaluator] = {
@@ -790,15 +928,15 @@ def create_value_backup_event(
 
 def replay_value_backups(
     adaptive_spec: AdaptiveSearchSpec,
+    graph: SearchGraphProjection,
     records: list[CandidateRecord],
     events: list[ValueBackupEvent],
-) -> list[CandidateRecord]:
+) -> ValueProjection:
     config = adaptive_spec.value_backup
     config_hash = value_backup_config_hash(adaptive_spec)
-    for record in records:
-        record.node_values = materialize_node_values(record, adaptive_spec)
     operator = _value_backup_operator(config.name, config.version)
     return operator.replay(
+        graph,
         records,
         events,
         config.params,
@@ -806,55 +944,167 @@ def replay_value_backups(
     )
 
 
-def materialize_node_values(
-    record: CandidateRecord,
-    adaptive_spec: AdaptiveSearchSpec | None = None,
-) -> list[NodeValueRecord]:
-    """Backfill immutable settled nodes without changing existing backup state."""
+def project_search_graph(
+    run_id: str,
+    records: list[CandidateRecord],
+    *,
+    created_at: str,
+) -> SearchGraphProjection:
+    """Project immutable search nodes and transitions from settled iterations."""
 
-    backup_name = "identity"
-    backup_version = 1
-    backup_hash: str | None = None
-    if adaptive_spec is not None:
-        backup_name = adaptive_spec.value_backup.name
-        backup_version = adaptive_spec.value_backup.version
-        backup_hash = value_backup_config_hash(adaptive_spec)
-    nodes = list(record.node_values)
-    existing_iterations = {node.iteration for node in nodes}
-    for iteration in record.iterations:
-        reward = iteration.reward_evaluation
-        if (
-            iteration.iteration in existing_iterations
-            or iteration.disposition not in {"keep", "retain"}
-            or iteration.process_passed is not True
-            or iteration.git_head is None
-            or reward is None
-            or reward.status != "evaluated"
-            or reward.settled_value is None
-        ):
-            continue
-        digest = hashlib.sha256(
-            (iteration.git_head + reward.reward_id).encode("utf-8")
-        ).hexdigest()[:12]
-        nodes.append(
-            NodeValueRecord(
-                node_id=(
-                    f"node_{record.candidate_id}_{iteration.iteration:04d}_{digest}"
-                ),
-                candidate_id=record.candidate_id,
-                iteration=iteration.iteration,
-                evidence_commit=iteration.git_head,
-                reward_id=reward.reward_id,
-                settled_value=reward.settled_value,
-                backed_up_value=reward.settled_value,
-                backup_operator_name=backup_name,
-                backup_operator_version=backup_version,
-                backup_config_hash=backup_hash,
-                created_at=iteration.created_at,
-                updated_at=iteration.created_at,
+    nodes: list[SearchNodeRecord] = []
+    transitions: list[SearchTransitionRecord] = []
+    nodes_by_id: dict[str, SearchNodeRecord] = {}
+    current_node_ids: dict[str, str] = {}
+    timestamps: list[str] = []
+
+    ordered_records = sorted(
+        records,
+        key=lambda item: (item.task.allocation_depth, item.candidate_id),
+    )
+    for record in ordered_records:
+        if record.task.run_id != run_id:
+            raise ValueError(
+                f"candidate {record.candidate_id} belongs to another run"
             )
-        )
-    return sorted(nodes, key=lambda item: item.iteration)
+        source = record.task.expansion_source
+        if source is None:
+            base_commit = _candidate_base_commit(record)
+            root_id = _stable_id(
+                "root",
+                run_id,
+                record.candidate_id,
+                base_commit,
+            )
+            root = SearchNodeRecord(
+                node_id=root_id,
+                run_id=run_id,
+                kind="virtual_root",
+                candidate_id=record.candidate_id,
+                settled_commit=base_commit,
+                transition_depth=0,
+                allocation_depth=record.task.allocation_depth,
+                created_at=(
+                    record.iterations[0].created_at
+                    if record.iterations
+                    else created_at
+                ),
+            )
+            nodes.append(root)
+            nodes_by_id[root_id] = root
+            current_node_id = root_id
+        else:
+            if source.node_id not in nodes_by_id:
+                raise ValueError(
+                    f"expansion source node is unavailable: {source.node_id}"
+                )
+            current_node_id = source.node_id
+
+        for position, iteration in enumerate(record.iterations):
+            if iteration.disposition is None:
+                continue
+            reward = iteration.reward_evaluation
+            transition_id = _stable_id(
+                "transition",
+                run_id,
+                record.candidate_id,
+                str(iteration.iteration),
+                iteration.git_head or "no-attempt-commit",
+            )
+            accepted = (
+                iteration.process_passed is True
+                and iteration.disposition in {"keep", "retain"}
+            )
+            accepted_node_id: str | None = None
+            settled_node_id = current_node_id
+            settled_commit = (
+                iteration.workspace_git_head_after_settlement
+                or iteration.ledger_git_head
+                or iteration.git_head
+            )
+            if accepted:
+                if settled_commit is None:
+                    raise ValueError(
+                        "accepted iteration requires an exact settlement commit"
+                    )
+                accepted_node_id = _stable_id(
+                    "node",
+                    run_id,
+                    record.candidate_id,
+                    str(iteration.iteration),
+                    settled_commit,
+                )
+                parent = nodes_by_id[current_node_id]
+                node = SearchNodeRecord(
+                    node_id=accepted_node_id,
+                    run_id=run_id,
+                    kind="settled_iteration",
+                    candidate_id=record.candidate_id,
+                    iteration=iteration.iteration,
+                    parent_node_id=current_node_id,
+                    incoming_transition_id=transition_id,
+                    evidence_commit=iteration.git_head,
+                    settled_commit=settled_commit,
+                    artifact_hash=iteration.artifact_hash,
+                    score=iteration.score,
+                    reward_id=reward.reward_id if reward is not None else None,
+                    settled_value=(
+                        reward.settled_value if reward is not None else None
+                    ),
+                    transition_depth=parent.transition_depth + 1,
+                    allocation_depth=record.task.allocation_depth,
+                    created_at=iteration.created_at,
+                )
+                nodes.append(node)
+                nodes_by_id[node.node_id] = node
+                settled_node_id = node.node_id
+
+            kind = "candidate_continuation"
+            if position == 0:
+                kind = (
+                    "derived_candidate_start"
+                    if source is not None
+                    else "initial_attempt"
+                )
+            transitions.append(
+                SearchTransitionRecord(
+                    transition_id=transition_id,
+                    run_id=run_id,
+                    candidate_id=record.candidate_id,
+                    iteration=iteration.iteration,
+                    kind=kind,
+                    from_node_id=current_node_id,
+                    accepted_node_id=accepted_node_id,
+                    settled_node_id=settled_node_id,
+                    attempt_base_commit=iteration.attempt_base_git_head,
+                    attempt_commit=iteration.git_head,
+                    settled_commit=settled_commit,
+                    disposition=iteration.disposition,
+                    process_passed=iteration.process_passed is True,
+                    score=iteration.score,
+                    reward_id=reward.reward_id if reward is not None else None,
+                    attempt_reward=(
+                        reward.attempt_reward if reward is not None else None
+                    ),
+                    created_at=iteration.created_at,
+                )
+            )
+            timestamps.append(iteration.created_at)
+            if accepted_node_id is not None:
+                current_node_id = accepted_node_id
+        current_node_ids[record.candidate_id] = current_node_id
+
+    graph_created_at = min(timestamps) if timestamps else created_at
+    graph_updated_at = max(timestamps) if timestamps else created_at
+    return SearchGraphProjection(
+        run_id=run_id,
+        revision=len(transitions) + len(current_node_ids),
+        nodes=nodes,
+        transitions=transitions,
+        candidate_current_node_ids=current_node_ids,
+        created_at=graph_created_at,
+        updated_at=graph_updated_at,
+    )
 
 
 def _reward_evaluator(name: str, version: int) -> RewardEvaluator:
@@ -890,31 +1140,96 @@ def _evaluated_rewards(record: CandidateRecord) -> list[RewardEvaluation]:
     ]
 
 
-def _reset_node_values(
+def _initial_value_projection(
+    graph: SearchGraphProjection,
     records: list[CandidateRecord],
+    *,
     operator_name: str,
     operator_version: int,
     config_hash: str,
-) -> None:
-    for record in records:
-        record.node_values = [
-            node.model_copy(
-                update={
-                    "backed_up_value": node.settled_value,
-                    "backup_operator_name": operator_name,
-                    "backup_operator_version": operator_version,
-                    "backup_config_hash": config_hash,
-                    "backup_count": 0,
-                    "backup_mean_return": None,
-                    "backup_best_return": None,
-                    "updated_at": node.created_at,
-                }
+) -> ValueProjection:
+    direct_attempts: dict[str, int] = {}
+    unique_branches: dict[str, set[str]] = {}
+    total_costs: dict[str, float] = {}
+    iteration_costs = {
+        (record.candidate_id, iteration.iteration): float(
+            (iteration.reward_evaluation.components or {}).get(
+                "verifier_elapsed_seconds",
+                0.0,
             )
-            for node in record.node_values
-        ]
+        )
+        for record in records
+        for iteration in record.iterations
+        if iteration.reward_evaluation is not None
+    }
+    for transition in graph.transitions:
+        direct_attempts[transition.from_node_id] = (
+            direct_attempts.get(transition.from_node_id, 0) + 1
+        )
+        if transition.accepted_node_id is not None:
+            unique_branches.setdefault(transition.from_node_id, set()).add(
+                transition.accepted_node_id
+            )
+        total_costs[transition.from_node_id] = (
+            total_costs.get(transition.from_node_id, 0.0)
+            + iteration_costs.get(
+                (transition.candidate_id, transition.iteration),
+                0.0,
+            )
+        )
+
+    completed_expansions: dict[str, int] = {}
+    unobserved_expansions: dict[str, int] = {}
+    for record in records:
+        source = record.task.expansion_source
+        if source is None:
+            continue
+        unique_branches.setdefault(source.node_id, set()).add(
+            f"candidate:{record.candidate_id}"
+        )
+        target = completed_expansions if record.iterations else unobserved_expansions
+        target[source.node_id] = target.get(source.node_id, 0) + 1
+
+    node_values = [
+        NodeValueEstimate(
+            node_id=node.node_id,
+            settled_value=node.settled_value,
+            backed_up_value=node.settled_value,
+            direct_attempt_count=direct_attempts.get(node.node_id, 0),
+            unique_branch_count=len(unique_branches.get(node.node_id, set())),
+            completed_expansion_count=completed_expansions.get(node.node_id, 0),
+            unobserved_expansion_count=unobserved_expansions.get(node.node_id, 0),
+            total_cost=total_costs.get(node.node_id, 0.0),
+            updated_at=node.created_at,
+        )
+        for node in graph.nodes
+    ]
+    edge_values = [
+        EdgeValueEstimate(
+            transition_id=transition.transition_id,
+            from_node_id=transition.from_node_id,
+            settled_node_id=transition.settled_node_id,
+            attempt_reward=transition.attempt_reward,
+            created_at=transition.created_at,
+        )
+        for transition in graph.transitions
+    ]
+    return ValueProjection(
+        run_id=graph.run_id,
+        graph_revision=graph.revision,
+        operator_name=operator_name,
+        operator_version=operator_version,
+        config_hash=config_hash,
+        node_values=node_values,
+        edge_values=edge_values,
+        created_at=graph.created_at,
+        updated_at=graph.updated_at,
+    )
 
 
 def _source_options(
+    graph: SearchGraphProjection,
+    values: ValueProjection,
     records: list[CandidateRecord],
     *,
     max_depth: int,
@@ -930,60 +1245,60 @@ def _source_options(
             )
     total_expansions = sum(expansion_visits.values())
     options: list[_SourceOption] = []
-    for record in records:
-        if record.results_ledger_git_head is None:
+    records_by_id = {item.candidate_id: item for item in records}
+    values_by_id = {item.node_id: item for item in values.node_values}
+    for node in graph.nodes:
+        if node.kind != "settled_iteration" or node.iteration is None:
             continue
-        iterations = {item.iteration: item for item in record.iterations}
-        for node in materialize_node_values(record):
-            iteration = iterations.get(node.iteration)
-            if (
-                iteration is None
-                or iteration.disposition not in {"keep", "retain"}
-                or iteration.process_passed is not True
-                or iteration.score is None
-                or iteration.git_head is None
-                or iteration.artifact_hash is None
-            ):
-                continue
-            ineligible_reason = None
-            if record.task.allocation_depth >= max_depth:
-                ineligible_reason = "max_depth"
-            elif (
-                not include_retired
-                and record.allocation_eligibility != "eligible"
-            ):
-                ineligible_reason = "retired"
-            visits = expansion_visits.get(node.node_id, 0)
-            exploration_bonus = exploration_weight * math.sqrt(
-                math.log(total_expansions + 2.0) / (visits + 1.0)
-            )
-            priority = node.backed_up_value + exploration_bonus
-            source = ExpansionSource(
-                node_id=node.node_id,
-                candidate_id=record.candidate_id,
-                iteration=iteration.iteration,
-                evidence_commit=iteration.git_head,
-                settled_commit=record.results_ledger_git_head,
-                artifact_hash=iteration.artifact_hash,
-                score=iteration.score,
-                reward_id=node.reward_id,
-                settled_value=node.settled_value,
-                backed_up_value=node.backed_up_value,
-            )
-            snapshot = AllocationSourceSnapshot(
-                candidate_id=record.candidate_id,
-                node_id=node.node_id,
-                iteration=iteration.iteration,
-                allocation_depth=record.task.allocation_depth,
-                settled_value=node.settled_value,
-                backed_up_value=node.backed_up_value,
-                expansion_visits=visits,
-                exploration_bonus=exploration_bonus,
-                priority=priority,
-                eligible=ineligible_reason is None,
-                ineligible_reason=ineligible_reason,
-            )
-            options.append(_SourceOption(source=source, snapshot=snapshot))
+        record = records_by_id.get(node.candidate_id)
+        value = values_by_id.get(node.node_id)
+        if (
+            record is None
+            or value is None
+            or node.score is None
+            or node.evidence_commit is None
+            or node.artifact_hash is None
+            or node.reward_id is None
+            or node.settled_value is None
+            or value.backed_up_value is None
+        ):
+            continue
+        ineligible_reason = None
+        if record.task.allocation_depth >= max_depth:
+            ineligible_reason = "max_depth"
+        elif not include_retired and record.allocation_eligibility != "eligible":
+            ineligible_reason = "retired"
+        visits = expansion_visits.get(node.node_id, 0)
+        exploration_bonus = exploration_weight * math.sqrt(
+            math.log(total_expansions + 2.0) / (visits + 1.0)
+        )
+        priority = value.backed_up_value + exploration_bonus
+        source = ExpansionSource(
+            node_id=node.node_id,
+            candidate_id=record.candidate_id,
+            iteration=node.iteration,
+            evidence_commit=node.evidence_commit,
+            settled_commit=node.settled_commit,
+            artifact_hash=node.artifact_hash,
+            score=node.score,
+            reward_id=node.reward_id,
+            settled_value=node.settled_value,
+            backed_up_value=value.backed_up_value,
+        )
+        snapshot = AllocationSourceSnapshot(
+            candidate_id=record.candidate_id,
+            node_id=node.node_id,
+            iteration=node.iteration,
+            allocation_depth=record.task.allocation_depth,
+            settled_value=node.settled_value,
+            backed_up_value=value.backed_up_value,
+            expansion_visits=visits,
+            exploration_bonus=exploration_bonus,
+            priority=priority,
+            eligible=ineligible_reason is None,
+            ineligible_reason=ineligible_reason,
+        )
+        options.append(_SourceOption(source=source, snapshot=snapshot))
     return sorted(
         options,
         key=lambda item: (
@@ -996,11 +1311,15 @@ def _source_options(
 
 
 def _highest_value_source(
+    graph: SearchGraphProjection,
+    values: ValueProjection,
     records: list[CandidateRecord],
     *,
     max_depth: int,
 ) -> ExpansionSource | None:
     options = _source_options(
+        graph,
+        values,
         records,
         max_depth=max_depth,
         exploration_weight=0.0,
@@ -1010,3 +1329,106 @@ def _highest_value_source(
         (item.source for item in options if item.snapshot.eligible),
         None,
     )
+
+
+def _candidate_base_commit(record: CandidateRecord) -> str:
+    if record.iterations:
+        first = record.iterations[0]
+        commit = first.attempt_base_git_head or record.task.workspace_base_revision
+    else:
+        commit = record.task.workspace_base_revision
+    if commit is None:
+        raise ValueError(
+            f"candidate {record.candidate_id} has no workspace base revision"
+        )
+    return commit
+
+
+def _stable_id(prefix: str, *parts: str) -> str:
+    digest = hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()[:16]
+    return f"{prefix}_{digest}"
+
+
+class AdaptiveSearchEngine:
+    """Host-neutral adaptive search computations."""
+
+    def __init__(
+        self,
+        *,
+        constraint_evaluators: tuple[AllocationConstraintEvaluator, ...] = (),
+        reservation_planner: AllocationReservationPlanner | None = None,
+    ) -> None:
+        self._constraint_evaluators = constraint_evaluators
+        self._reservation_planner = reservation_planner
+
+    def evaluate_reward(
+        self,
+        adaptive_spec: AdaptiveSearchSpec,
+        context: RewardContext,
+    ) -> RewardEvaluation:
+        return evaluate_reward(adaptive_spec, context)
+
+    def validate_spec(self, adaptive_spec: AdaptiveSearchSpec) -> None:
+        validate_adaptive_search_spec(adaptive_spec)
+
+    def project(
+        self,
+        run_id: str,
+        records: list[CandidateRecord],
+        *,
+        created_at: str,
+    ) -> SearchGraphProjection:
+        return project_search_graph(run_id, records, created_at=created_at)
+
+    def settle_values(
+        self,
+        adaptive_spec: AdaptiveSearchSpec,
+        context: ValueBackupContext,
+        existing_events: list[ValueBackupEvent],
+    ) -> tuple[ValueBackupEvent | None, ValueProjection]:
+        event = create_value_backup_event(adaptive_spec, context)
+        events = list(existing_events)
+        if event is not None and not any(
+            item.event_id == event.event_id for item in events
+        ):
+            events.append(event)
+        return event, replay_value_backups(
+            adaptive_spec,
+            context.graph,
+            context.records,
+            events,
+        )
+
+    def replay_values(
+        self,
+        adaptive_spec: AdaptiveSearchSpec,
+        graph: SearchGraphProjection,
+        records: list[CandidateRecord],
+        events: list[ValueBackupEvent],
+    ) -> ValueProjection:
+        return replay_value_backups(
+            adaptive_spec,
+            graph,
+            records,
+            events,
+        )
+
+    def decide(
+        self,
+        context: AllocationContext,
+    ) -> AllocationRecommendation | None:
+        recommendation = decide_allocation(context)
+        if recommendation is None:
+            return None
+        for evaluator in self._constraint_evaluators:
+            evaluator.validate(context, recommendation)
+        return recommendation
+
+    def reserve(
+        self,
+        context: AllocationContext,
+        recommendation: AllocationRecommendation,
+    ) -> AllocationReservationPlan | None:
+        if self._reservation_planner is None:
+            return None
+        return self._reservation_planner.plan(context, recommendation)

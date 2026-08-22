@@ -12,6 +12,7 @@ from goal_plus.evidence_annotator import (
 )
 from goal_plus.models import (
     AdaptiveSearchSpec,
+    CandidateRecord,
     ExpansionSource,
     RewardEvaluation,
     SearchSpec,
@@ -247,6 +248,25 @@ def test_legacy_value_names_are_read_but_not_rewritten() -> None:
     assert source.node_id.startswith("node_c001_0001_")
 
 
+def test_candidate_record_rejects_removed_node_value_cache() -> None:
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        CandidateRecord.model_validate(
+            {
+                "candidate_id": "c001",
+                "status": "created",
+                "task": {
+                    "run_id": "run_test",
+                    "candidate_id": "c001",
+                    "hypothesis": "",
+                    "workspace": ".",
+                    "allowed_files": [],
+                    "denied_files": [],
+                },
+                "node_values": [],
+            }
+        )
+
+
 def test_adaptive_reward_prunes_and_derives_exact_incumbent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -292,6 +312,21 @@ def test_adaptive_reward_prunes_and_derives_exact_incumbent(
     assert second_high.reward_evaluation is not None
     assert second_high.reward_evaluation.attempt_reward == 1.0
     assert second_high.allocation_decision is None
+    high_after_second = runtime._load_candidate_record(run_id, high.candidate_id)
+    exact_high_source_commit = high_after_second.iterations[1].ledger_git_head
+    assert exact_high_source_commit is not None
+    high.workspace.joinpath("initial_program.py").write_text(
+        "VALUE = 9\n", encoding="utf-8"
+    )
+    third_high = runtime.run_verifier(
+        run_id,
+        high.candidate_id,
+        agent_session_id=sessions[high.candidate_id].agent_session_id,
+        hypothesis="reject a regression after the historical high-value node",
+    )
+    assert third_high.disposition == "discard"
+    high_after_third = runtime._load_candidate_record(run_id, high.candidate_id)
+    assert high_after_third.results_ledger_git_head != exact_high_source_commit
 
     low.workspace.joinpath("initial_program.py").write_text(
         "VALUE = 1\n", encoding="utf-8"
@@ -338,6 +373,7 @@ def test_adaptive_reward_prunes_and_derives_exact_incumbent(
     assert expand.source.score == 11.0
     assert expand.source.settled_value == 11.0
     assert expand.source.backed_up_value == 11.0
+    assert expand.source.settled_commit == exact_high_source_commit
 
     assert runtime._load_evidence_annotation_task(
         run_id,
@@ -357,7 +393,7 @@ def test_adaptive_reward_prunes_and_derives_exact_incumbent(
         runtime.root_dir,
         run_id,
         annotator=_StaticAnnotator(),
-    ) == 4
+    ) == 5
     pruned_evidence = next(
         item
         for item in runtime.get_global_evidence(
@@ -390,6 +426,14 @@ def test_adaptive_reward_prunes_and_derives_exact_incumbent(
     assert child_task["expansion_source"]["evidence_commit"] == (
         expand.source.evidence_commit
     )
+    applied_values = runtime._load_value_projection(run_id)
+    assert applied_values is not None
+    applied_source_value = next(
+        item
+        for item in applied_values.node_values
+        if item.node_id == expand.source.node_id
+    )
+    assert applied_source_value.unobserved_expansion_count == 1
     child_workspace = Path(child_task["workspace"])
     assert child_workspace.joinpath("initial_program.py").read_text(
         encoding="utf-8"
@@ -436,9 +480,11 @@ def test_adaptive_reward_prunes_and_derives_exact_incumbent(
     assert snapshot["candidates"][low.candidate_id][
         "last_reward_evaluation"
     ]["attempt_reward"] == 0.0
-    assert snapshot["candidates"][high.candidate_id]["last_node_value"][
+    assert snapshot["candidates"][high.candidate_id]["current_value_estimate"][
         "backed_up_value"
     ] == 11.0
+    assert snapshot["run"]["adaptive_search"]["search_graph"]["available"]
+    assert snapshot["run"]["adaptive_search"]["value_projection"]["available"]
 
     report_data = build_html_report_data(runtime.root_dir, run_id)
     [reported_task] = report_data["search_tasks"]
@@ -550,18 +596,42 @@ def test_value_guided_allocation_backs_child_return_into_source_node(
     child_iteration = child_record.iterations[-1]
     assert child_iteration.value_backup_event_id is not None
     assert child_iteration.value_backup_error is None
-    [backup_event] = runtime._load_value_backup_events(run_id)
+    backup_event = next(
+        item
+        for item in runtime._load_value_backup_events(run_id)
+        if item.event_id == child_iteration.value_backup_event_id
+    )
     assert backup_event.event_id == child_iteration.value_backup_event_id
     assert backup_event.targets[0].node_id == expand.source.node_id
 
-    updated_high = runtime._load_candidate_record(run_id, high.candidate_id)
+    graph = runtime._load_search_graph_projection(run_id)
+    values = runtime._load_value_projection(run_id)
+    assert graph is not None
+    assert values is not None
     source_node = next(
-        item for item in updated_high.node_values
+        item for item in values.node_values
         if item.node_id == expand.source.node_id
     )
     assert source_node.backup_count == 1
     assert source_node.backup_mean_return is not None
     assert source_node.backed_up_value < source_node.settled_value
+    child_transition = next(
+        item
+        for item in graph.transitions
+        if item.candidate_id == child_task["candidate_id"]
+    )
+    assert child_transition.kind == "derived_candidate_start"
+    assert child_transition.from_node_id == expand.source.node_id
+    assert child_transition.accepted_node_id is None
+    assert child_transition.settled_node_id == expand.source.node_id
+    source_graph_node = next(
+        item for item in graph.nodes if item.node_id == expand.source.node_id
+    )
+    assert source_graph_node.parent_node_id is not None
+    assert [item.node_id for item in backup_event.targets[:2]] == [
+        expand.source.node_id,
+        source_graph_node.parent_node_id,
+    ]
 
 
 def test_allocation_error_does_not_block_annotation_task(
@@ -584,7 +654,7 @@ def test_allocation_error_does_not_block_annotation_task(
     def fail_allocation(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("simulated allocation failure")
 
-    monkeypatch.setattr("goal_plus.runtime.decide_allocation", fail_allocation)
+    monkeypatch.setattr(runtime._adaptive_search, "decide", fail_allocation)
     task.workspace.joinpath("initial_program.py").write_text(
         "VALUE = 2\n", encoding="utf-8"
     )

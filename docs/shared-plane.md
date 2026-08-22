@@ -119,19 +119,22 @@ worker，再冻结修正后的 spec，创建 successor run。旧分数不能跨�
 ### Adaptive Search value-guided allocation
 
 `strategy.orchestration_mode="adaptive_search"` 保留同一条主流程，只在 verifier settlement
-之后增加三个隔离步骤：注册的 `RewardEvaluator` 计算 `RewardEvaluation`，注册的
-`ValueBackupOperator` 从派生结果生成可重放的 `ValueBackupEvent`，注册的
-`AllocationPolicy` 根据已持久化 reward/node state 决定是否产生 `AllocationDecision`。
+之后由 `AdaptiveSearchEngine` 增加四个隔离步骤：注册的 `RewardEvaluator` 计算
+`RewardEvaluation`，`SearchGraphProjection` 从已结算 iteration 投影搜索图，注册的
+`ValueBackupOperator` 生成并重放 `ValueBackupEvent` 得到 `ValueProjection`，注册的
+`AllocationPolicy` 根据 graph/value projection 决定是否产生 `AllocationDecision`。
 兼容组件为 `metric_progress/v1`、`identity/v1` 和 `low_reward_replace/v1`；value-guided
 组件为 `metric_progress/v2`、`discounted_mean_best/v1` 和
 `value_guided_replace/v1`。未知 name/version 在 freeze 时拒绝。
 
 Value layer 把三个概念分开持久化：`RewardEvaluation.attempt_reward` 描述本次被测尝试产生的
 方向归一化即时回报；`metric_progress/v1` 保持原有结算语义，退化尝试回滚到 incumbent 后为零；
-`RewardEvaluation.settled_value` 描述 keep/retain/restore 完成后的 candidate-local 绝对效用；
-可派生的 keep/retain Evidence 另存为 `NodeValueRecord`，其中 `backed_up_value` 是 allocation
-读取的树节点值。`identity/v1` 令 `backed_up_value == settled_value`；
-`discounted_mean_best/v1` 把派生候选的 settled value 与 V2 负/正 attempt reward 沿固定 lineage
+`RewardEvaluation.settled_value` 描述 keep/retain/restore 完成后的 candidate-local 绝对效用。
+`SearchGraphProjection` 把每次 verifier settlement 表示为 transition：keep/retain 创建
+`settled_iteration` 节点，discard/failure 结算回原节点，派生 candidate 的首条 transition 从
+decision 固定的 source node 接入。`ValueProjection.node_values[].backed_up_value` 是 allocation
+读取的节点值。`identity/v1` 令 `backed_up_value == settled_value`；
+`discounted_mean_best/v1` 把 settled value 与 V2 负/正 attempt reward 沿实际 transition 祖先链
 折扣回传，并以 own value、mean return 和 best return 的稳定混合更新节点。旧状态中的
 `reward/state_value` 在读取时迁移为前两个
 字段，新写入不再产生旧名称。
@@ -148,7 +151,7 @@ annotation task 写入或启动失败不会阻止 reward、retirement 或 expans
 
 兼容 low-reward policy 只检查触发 candidate 的连续低 reward。value-guided policy 在最小样本数
 后计算近期 reward mean、standard error、探索 bonus 和 lane UCB；只有近期非正收益比例与 UCB
-同时满足退休条件才产生替换。命中后，runtime 原子持久化
+同时满足退休条件才产生替换。命中后，runtime 在一个不可变 decision 中持久化配对的
 `retire_candidate + expand_candidate` actions，立即 fence 被退休 candidate，并把派生来源固定到
 最高 `backed_up_value + exploration_bonus` 的 verifier-backed Evidence、settled Git commit 和
 模型 provenance。完整 `AllocationStateSnapshot` 与 decision 一起保存，异步完成顺序不会改变
@@ -165,8 +168,11 @@ Evidence 可见性、创建 `AgentSessionRecord`，然后返回 host-native laun
 
 allocation decision 保存在 `.gp/runs/<run_id>/allocation-decisions/*.json`，不可变 backup event
 保存在 `.gp/runs/<run_id>/value-backups/*.json`，reward 保存在对应 `IterationRecord`，重放后的
-节点缓存保存在 `CandidateRecord.node_values`。`best.json`、selection 与 promotion 仍只认硬
-verifier score；value layer 只影响 runtime allocation。
+搜索图保存在 `.gp/runs/<run_id>/adaptive-search/search-graph.json`，重放后的值保存在同目录的
+`value-projection.json`。两者都可从 candidate iteration 与 backup event 重建，candidate record
+不保存派生节点缓存。`best.json`、selection 与 promotion 仍只认硬 verifier score；value layer
+只影响 runtime allocation。当前 engine 已预留 allocation constraint 与 reservation planner 接口，
+但尚未实现原子多候选 reservation、探索配额或 frontier width 限制。
 
 该模式只适用于可以合法向 worker 暴露硬 metric 的优化任务。隐藏答案 benchmark 不能把
 gold correctness、score、reward 或由它们派生的 allocation decision 暴露给 worker；这类任务
