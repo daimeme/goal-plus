@@ -759,7 +759,7 @@ class DiscountedMeanBestBackupOperator:
         )
         nodes = {item.node_id: item for item in projection.node_values}
         edges = {item.transition_id: item for item in projection.edge_values}
-        graph_nodes = {item.node_id: item for item in graph.nodes}
+        graph_nodes, graph_nodes_by_coordinate = _graph_node_indexes(graph)
         transitions = {
             (item.candidate_id, item.iteration): item
             for item in graph.transitions
@@ -790,7 +790,12 @@ class DiscountedMeanBestBackupOperator:
                 + config.attempt_reward_weight * event.attempt_reward
             )
             for target in event.targets:
-                node = nodes.get(target.node_id)
+                target_node_id = _resolve_backup_target_node_id(
+                    target,
+                    graph_nodes,
+                    graph_nodes_by_coordinate,
+                )
+                node = nodes.get(target_node_id)
                 if node is None:
                     raise ValueError(
                         f"backup event target node is unavailable: {target.node_id}"
@@ -799,7 +804,7 @@ class DiscountedMeanBestBackupOperator:
                     raise ValueError(
                         f"backup event target has no settled value: {target.node_id}"
                     )
-                if graph_nodes[target.node_id].candidate_id != target.candidate_id:
+                if graph_nodes[target_node_id].candidate_id != target.candidate_id:
                     raise ValueError(
                         f"backup event target candidate mismatch: {target.node_id}"
                     )
@@ -1080,11 +1085,17 @@ def project_allocation_resources(
 
     materialized_ids = {record.candidate_id for record in records}
     unobserved_ids_by_node: dict[str, set[str]] = {}
+    graph_nodes, graph_nodes_by_coordinate = _graph_node_indexes(graph)
 
     for record in records:
         source = record.task.expansion_source
         if source is not None and not record.iterations:
-            unobserved_ids_by_node.setdefault(source.node_id, set()).add(
+            source_node_id = _resolve_expansion_source_node_from_indexes(
+                source,
+                graph_nodes,
+                graph_nodes_by_coordinate,
+            ).node_id
+            unobserved_ids_by_node.setdefault(source_node_id, set()).add(
                 record.candidate_id
             )
 
@@ -1098,8 +1109,13 @@ def project_allocation_resources(
             child_id = action.new_candidate_id
             if child_id not in materialized_ids:
                 unmaterialized_expansion_ids.add(child_id)
+                source_node_id = _resolve_expansion_source_node_from_indexes(
+                    action.source,
+                    graph_nodes,
+                    graph_nodes_by_coordinate,
+                ).node_id
                 unobserved_ids_by_node.setdefault(
-                    action.source.node_id,
+                    source_node_id,
                     set(),
                 ).add(child_id)
 
@@ -1160,6 +1176,100 @@ def replay_value_backups(
     )
 
 
+def _graph_node_indexes(
+    graph: SearchGraphProjection,
+) -> tuple[
+    dict[str, SearchNodeRecord],
+    dict[tuple[str, int], SearchNodeRecord],
+]:
+    return (
+        {item.node_id: item for item in graph.nodes},
+        {
+            (item.candidate_id, item.iteration): item
+            for item in graph.nodes
+            if item.kind == "settled_iteration" and item.iteration is not None
+        },
+    )
+
+
+def _resolve_expansion_source_node_from_indexes(
+    source: ExpansionSource,
+    nodes_by_id: Mapping[str, SearchNodeRecord],
+    nodes_by_coordinate: Mapping[tuple[str, int], SearchNodeRecord],
+) -> SearchNodeRecord:
+    node = nodes_by_id.get(source.node_id)
+    legacy_alias = node is None
+    if node is None:
+        legacy_iteration = _legacy_node_iteration(
+            source.node_id,
+            source.candidate_id,
+        )
+        if legacy_iteration != source.iteration:
+            raise ValueError(
+                f"expansion source node is unavailable: {source.node_id}"
+            )
+        node = nodes_by_coordinate.get((source.candidate_id, source.iteration))
+    if node is None or node.kind != "settled_iteration":
+        raise ValueError(
+            f"expansion source node is unavailable: {source.node_id}"
+        )
+
+    expected_facts = {
+        "candidate_id": source.candidate_id,
+        "iteration": source.iteration,
+        "evidence_commit": source.evidence_commit,
+        "artifact_hash": source.artifact_hash,
+        "score": source.score,
+        "reward_id": source.reward_id,
+        "settled_value": source.settled_value,
+    }
+    mismatches = [
+        name
+        for name, expected in expected_facts.items()
+        if getattr(node, name) != expected
+    ]
+    if not legacy_alias and node.settled_commit != source.settled_commit:
+        mismatches.append("settled_commit")
+    if mismatches:
+        raise ValueError(
+            "expansion source does not match the projected node: "
+            + ", ".join(mismatches)
+        )
+    return node
+
+
+def _legacy_node_iteration(node_id: str, candidate_id: str) -> int | None:
+    prefix = f"node_{candidate_id}_"
+    if not node_id.startswith(prefix):
+        return None
+    iteration_text, separator, digest = node_id[len(prefix) :].partition("_")
+    if (
+        not separator
+        or not iteration_text.isdigit()
+        or len(digest) != 12
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        return None
+    iteration = int(iteration_text)
+    return iteration if iteration >= 1 else None
+
+
+def _resolve_backup_target_node_id(
+    target: ValueBackupTarget,
+    nodes_by_id: Mapping[str, SearchNodeRecord],
+    nodes_by_coordinate: Mapping[tuple[str, int], SearchNodeRecord],
+) -> str:
+    node = nodes_by_id.get(target.node_id)
+    if node is not None:
+        return node.node_id
+
+    iteration = _legacy_node_iteration(target.node_id, target.candidate_id)
+    if iteration is None:
+        return target.node_id
+    node = nodes_by_coordinate.get((target.candidate_id, iteration))
+    return node.node_id if node is not None else target.node_id
+
+
 def project_search_graph(
     run_id: str,
     records: list[CandidateRecord],
@@ -1171,6 +1281,7 @@ def project_search_graph(
     nodes: list[SearchNodeRecord] = []
     transitions: list[SearchTransitionRecord] = []
     nodes_by_id: dict[str, SearchNodeRecord] = {}
+    nodes_by_coordinate: dict[tuple[str, int], SearchNodeRecord] = {}
     current_node_ids: dict[str, str] = {}
     timestamps: list[str] = []
 
@@ -1210,11 +1321,11 @@ def project_search_graph(
             nodes_by_id[root_id] = root
             current_node_id = root_id
         else:
-            if source.node_id not in nodes_by_id:
-                raise ValueError(
-                    f"expansion source node is unavailable: {source.node_id}"
-                )
-            current_node_id = source.node_id
+            current_node_id = _resolve_expansion_source_node_from_indexes(
+                source,
+                nodes_by_id,
+                nodes_by_coordinate,
+            ).node_id
 
         for position, iteration in enumerate(record.iterations):
             if iteration.disposition is None:
@@ -1273,6 +1384,7 @@ def project_search_graph(
                 )
                 nodes.append(node)
                 nodes_by_id[node.node_id] = node
+                nodes_by_coordinate[(node.candidate_id, iteration.iteration)] = node
                 settled_node_id = node.node_id
 
             kind = "candidate_continuation"
@@ -1520,12 +1632,18 @@ def _initial_value_projection(
 
     completed_expansions: dict[str, int] = {}
     unobserved_expansions: dict[str, int] = {}
+    graph_nodes, graph_nodes_by_coordinate = _graph_node_indexes(graph)
     for record in records:
         source = record.task.expansion_source
         if source is None:
             continue
         target = completed_expansions if record.iterations else unobserved_expansions
-        target[source.node_id] = target.get(source.node_id, 0) + 1
+        source_node_id = _resolve_expansion_source_node_from_indexes(
+            source,
+            graph_nodes,
+            graph_nodes_by_coordinate,
+        ).node_id
+        target[source_node_id] = target.get(source_node_id, 0) + 1
 
     node_values = [
         NodeValueEstimate(
@@ -1575,11 +1693,17 @@ def _source_options(
     include_retired: bool,
 ) -> list[_SourceOption]:
     expansion_visits: dict[str, int] = {}
+    graph_nodes, graph_nodes_by_coordinate = _graph_node_indexes(graph)
     for record in records:
         source = record.task.expansion_source
         if source is not None:
-            expansion_visits[source.node_id] = (
-                expansion_visits.get(source.node_id, 0) + 1
+            source_node_id = _resolve_expansion_source_node_from_indexes(
+                source,
+                graph_nodes,
+                graph_nodes_by_coordinate,
+            ).node_id
+            expansion_visits[source_node_id] = (
+                expansion_visits.get(source_node_id, 0) + 1
             )
     total_expansions = sum(expansion_visits.values())
     options: list[_SourceOption] = []

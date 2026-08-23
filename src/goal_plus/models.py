@@ -1749,6 +1749,15 @@ class CandidateRecord(SearchModel):
     results_ledger: list[ResultLedgerEntry] = Field(default_factory=list)
     results_ledger_git_head: str | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def drop_legacy_node_value_cache(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or "node_values" not in value:
+            return value
+        payload = dict(value)
+        payload.pop("node_values", None)
+        return payload
+
 
 class AgentSessionRecord(SearchModel):
     agent_session_id: str

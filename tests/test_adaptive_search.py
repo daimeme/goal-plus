@@ -5,17 +5,26 @@ from pathlib import Path
 
 import pytest
 
-from goal_plus.adaptive_search import RewardContext, evaluate_reward
+from goal_plus.adaptive_search import (
+    RewardContext,
+    evaluate_reward,
+    project_allocation_resources,
+    project_search_graph,
+    replay_value_backups,
+    value_backup_config_hash,
+)
 from goal_plus.evidence_annotator import (
     EvidenceAnnotationResult,
     drain_evidence_annotations,
 )
 from goal_plus.models import (
     AdaptiveSearchSpec,
+    AllocationDecision,
     CandidateRecord,
     ExpansionSource,
     RewardEvaluation,
     SearchSpec,
+    ValueBackupEvent,
 )
 from goal_plus.monitor import goal_plus_monitor_snapshot
 from goal_plus.reporting import build_html_report_data, render_html_report
@@ -259,23 +268,244 @@ def test_legacy_value_names_are_read_but_not_rewritten() -> None:
     assert source.node_id.startswith("node_c001_0001_")
 
 
-def test_candidate_record_rejects_removed_node_value_cache() -> None:
-    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
-        CandidateRecord.model_validate(
-            {
+def test_candidate_record_reads_but_does_not_rewrite_legacy_node_value_cache() -> None:
+    record = CandidateRecord.model_validate(
+        {
+            "candidate_id": "c001",
+            "status": "created",
+            "task": {
+                "run_id": "run_test",
                 "candidate_id": "c001",
-                "status": "created",
-                "task": {
-                    "run_id": "run_test",
+                "hypothesis": "",
+                "workspace": ".",
+                "allowed_files": [],
+                "denied_files": [],
+            },
+            "node_values": [{"obsolete_cache_payload": True}],
+        }
+    )
+
+    assert "node_values" not in record.model_dump(mode="json")
+
+
+def test_legacy_adaptive_state_projects_into_current_value_and_allocation_layers() -> None:
+    run_id = "run_legacy"
+    created_at = "2026-08-18T00:00:00Z"
+    root_reward_id = "reward_c001_0001_legacy"
+    child_reward_id = "reward_c002_0001_legacy"
+    root = CandidateRecord.model_validate(
+        {
+            "candidate_id": "c001",
+            "status": "evaluated",
+            "task": {
+                "run_id": run_id,
+                "candidate_id": "c001",
+                "hypothesis": "root",
+                "workspace": ".",
+                "workspace_base_revision": "0" * 40,
+                "allowed_files": [],
+                "denied_files": [],
+            },
+            "iterations": [
+                {
+                    "iteration": 1,
+                    "score": 10.0,
+                    "process_passed": True,
+                    "git_head": "1" * 40,
+                    "attempt_base_git_head": "0" * 40,
+                    "ledger_git_head": "2" * 40,
+                    "artifact_hash": "a" * 64,
+                    "disposition": "keep",
+                    "reward_evaluation": {
+                        "reward_id": root_reward_id,
+                        "evaluator_name": "metric_progress",
+                        "evaluator_version": 1,
+                        "config_hash": "a" * 64,
+                        "status": "evaluated",
+                        "reward": 1.0,
+                        "state_value": 10.0,
+                        "created_at": created_at,
+                    },
+                    "workspace_git_head_after_settlement": "2" * 40,
+                    "created_at": created_at,
+                }
+            ],
+            "node_values": [{"obsolete_cache_payload": True}],
+            "results_ledger_git_head": "2" * 40,
+        }
+    )
+    child = CandidateRecord.model_validate(
+        {
+            "candidate_id": "c002",
+            "status": "evaluated",
+            "task": {
+                "run_id": run_id,
+                "candidate_id": "c002",
+                "parent_id": "c001",
+                "hypothesis": "legacy derived candidate",
+                "workspace": ".",
+                "workspace_base_revision": "3" * 40,
+                "allocation_depth": 1,
+                "expansion_source": {
                     "candidate_id": "c001",
-                    "hypothesis": "",
-                    "workspace": ".",
-                    "allowed_files": [],
-                    "denied_files": [],
+                    "iteration": 1,
+                    "evidence_commit": "1" * 40,
+                    "settled_commit": "3" * 40,
+                    "artifact_hash": "a" * 64,
+                    "score": 10.0,
+                    "reward_id": root_reward_id,
+                    "state_value": 10.0,
                 },
-                "node_values": [],
+                "allowed_files": [],
+                "denied_files": [],
+            },
+            "iterations": [
+                {
+                    "iteration": 1,
+                    "score": 9.0,
+                    "process_passed": True,
+                    "git_head": "4" * 40,
+                    "attempt_base_git_head": "3" * 40,
+                    "ledger_git_head": "5" * 40,
+                    "artifact_hash": "b" * 64,
+                    "disposition": "discard",
+                    "reward_evaluation": {
+                        "reward_id": child_reward_id,
+                        "evaluator_name": "metric_progress",
+                        "evaluator_version": 1,
+                        "config_hash": "a" * 64,
+                        "status": "evaluated",
+                        "reward": -1.0,
+                        "state_value": 10.0,
+                        "created_at": "2026-08-18T00:01:00Z",
+                    },
+                    "workspace_git_head_after_settlement": "5" * 40,
+                    "created_at": "2026-08-18T00:01:00Z",
+                }
+            ],
+            "results_ledger_git_head": "5" * 40,
+        }
+    )
+    pending_child = child.model_copy(
+        update={
+            "candidate_id": "c004",
+            "status": "created",
+            "task": child.task.model_copy(update={"candidate_id": "c004"}),
+            "iterations": [],
+            "results_ledger_git_head": None,
+        }
+    )
+    records = [root, child, pending_child]
+    graph = project_search_graph(run_id, records, created_at=created_at)
+    source_node = next(
+        node
+        for node in graph.nodes
+        if node.candidate_id == "c001" and node.iteration == 1
+    )
+    assert child.task.expansion_source is not None
+    assert child.task.expansion_source.node_id != source_node.node_id
+    child_transition = next(
+        item for item in graph.transitions if item.candidate_id == "c002"
+    )
+    assert child_transition.from_node_id == source_node.node_id
+    assert graph.candidate_current_node_ids["c002"] == source_node.node_id
+
+    invalid_source = child.task.expansion_source.model_copy(
+        update={"node_id": "unknown_node_alias"}
+    )
+    invalid_child = child.model_copy(
+        update={
+            "task": child.task.model_copy(
+                update={"expansion_source": invalid_source}
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="expansion source node is unavailable"):
+        project_search_graph(run_id, [root, invalid_child], created_at=created_at)
+
+    adaptive_spec = AdaptiveSearchSpec.model_validate(
+        {
+            "value_backup": {
+                "name": "discounted_mean_best",
+                "version": 1,
+                "params": {},
             }
-        )
+        }
+    )
+    backup = ValueBackupEvent.model_validate(
+        {
+            "event_id": "backup_c002_0001_legacy",
+            "run_id": run_id,
+            "source_candidate_id": "c002",
+            "source_iteration": 1,
+            "source_reward_id": child_reward_id,
+            "operator_name": "discounted_mean_best",
+            "operator_version": 1,
+            "config_hash": value_backup_config_hash(adaptive_spec),
+            "attempt_reward": -1.0,
+            "settled_value": 10.0,
+            "targets": [
+                {
+                    "candidate_id": "c001",
+                    "node_id": "node_c001_0001_abcdefabcdef",
+                    "distance": 1,
+                    "return_value": 9.5,
+                }
+            ],
+            "created_at": "2026-08-18T00:01:00Z",
+        }
+    )
+    values = replay_value_backups(adaptive_spec, graph, records, [backup])
+    source_value = next(
+        item for item in values.node_values if item.node_id == source_node.node_id
+    )
+    assert source_value.backup_count == 1
+    assert source_value.completed_expansion_count == 1
+    assert source_value.unobserved_expansion_count == 1
+    assert values.applied_backup_event_ids == [backup.event_id]
+
+    legacy_source = child.task.expansion_source.model_dump(mode="json")
+    legacy_source.pop("node_id")
+    legacy_source["state_value"] = legacy_source.pop("settled_value")
+    legacy_source.pop("backed_up_value")
+    decision = AllocationDecision.model_validate(
+        {
+            "decision_id": "allocation_0001",
+            "run_id": run_id,
+            "trigger_candidate_id": "c002",
+            "trigger_iteration": 1,
+            "trigger_commit": "4" * 40,
+            "trigger_reward_id": child_reward_id,
+            "policy_name": "low_reward_replace",
+            "policy_version": 1,
+            "config_hash": "c" * 64,
+            "actions": [
+                {
+                    "action_id": "allocation_0001:retire",
+                    "kind": "retire_candidate",
+                    "candidate_id": "c002",
+                    "reason": "legacy low reward",
+                },
+                {
+                    "action_id": "allocation_0001:expand",
+                    "kind": "expand_candidate",
+                    "source": legacy_source,
+                    "new_candidate_id": "c003",
+                    "reason": "legacy highest value source",
+                },
+            ],
+            "created_at": "2026-08-18T00:01:00Z",
+        }
+    )
+    resources = project_allocation_resources(
+        adaptive_spec,
+        graph,
+        records,
+        [decision],
+        max_candidates=5,
+    )
+    assert resources.pending_expansions == 1
+    assert resources.unobserved_expansions_by_node == {source_node.node_id: 2}
 
 
 def test_adaptive_reward_prunes_and_derives_exact_incumbent(
