@@ -106,6 +106,7 @@ promotion stays retryable in `ready_to_promote` and emits no patch.
 | Need | Read |
 |---|---|
 | Architecture, shared Evidence, rollback, and end-to-end flow | [Shared Plane](docs/shared-plane.md) |
+| Lazy Value Agent and near-prune barrier runtime | [Lazy Value Agent](docs/lazy-value-agent.md) |
 | Current MCP and Pi-local tools | [API](docs/api.md) |
 | Host capability comparison | [Agent Host Adapters](docs/agent-host-adapters.md) |
 | Runtime and host logs | [Debugging](docs/debugging-runtime.md) |

@@ -36,9 +36,15 @@ from goal_plus.agent_hosts import (
 from goal_plus.adaptive_search import (
     AdaptiveSearchEngine,
     AllocationContext,
+    EvidenceLLMValueParams,
+    PendingValueState,
     RewardContext,
     ValueBackupContext,
+    adaptive_component_hash,
     allocation_config_hash,
+    evaluate_evidence_llm_error,
+    evaluate_evidence_llm_reward,
+    is_deferred_reward,
 )
 from goal_plus.models import (
     AllocationAction,
@@ -51,6 +57,7 @@ from goal_plus.models import (
     CandidateTask,
     CandidateWorkOrder,
     EvidenceAnnotationTask,
+    EvidenceValueTask,
     FeedbackPolicy,
     EvidenceViewRecord,
     ExpansionActionContext,
@@ -69,6 +76,7 @@ from goal_plus.models import (
     ResultLedgerEntry,
     ResolvedCodexProvider,
     ResolvedEvidenceAnnotatorProfile,
+    ResolvedStructuredModelProfile,
     ScoreReport,
     SearchGraphProjection,
     SearchPlan,
@@ -83,6 +91,7 @@ from goal_plus.models import (
     VerifierResult,
     VerifierRole,
     ValueBackupEvent,
+    ValueBarrierRecommendation,
     ValueProjection,
     WorkerBudget,
     WorkerLaunchOptions,
@@ -248,6 +257,7 @@ EVIDENCE_ANNOTATION_RUN_STATES = WORKER_ITERATION_RUN_STATES | frozenset(
         RunState.PROMOTED,
     }
 )
+VALUE_AGENT_RUN_STATES = WORKER_ITERATION_RUN_STATES
 
 
 def utc_timestamp() -> str:
@@ -1547,6 +1557,7 @@ class FileSearchRuntime:
             ValueBackupContext(
                 run_id=run.run_id,
                 trigger_record=record,
+                trigger_iteration=iteration.iteration,
                 records=records,
                 graph=graph,
                 reward=reward,
@@ -2250,6 +2261,10 @@ class FileSearchRuntime:
         )
         records = self._load_candidate_records(run_id)
         view_descriptions: dict[tuple[str, int, str], str] = {}
+        value_feedback: dict[
+            tuple[str, int, str], tuple[str, str]
+        ] = {}
+        allowed_feedback_refs = set(source.hindsight_feedback_refs)
         for candidate in records:
             for iteration in candidate.iterations:
                 if iteration.agent_session_id is None or iteration.git_head is None:
@@ -2276,11 +2291,26 @@ class FileSearchRuntime:
                 view_descriptions[
                     (candidate.candidate_id, iteration.iteration, iteration.git_head)
                 ] = view.description
+        if allowed_feedback_refs:
+            for task in self._load_evidence_value_tasks(run_id):
+                if (
+                    task.state != "completed"
+                    or task.assessment is None
+                    or task.assessment_ref not in allowed_feedback_refs
+                ):
+                    continue
+                value_feedback[
+                    (task.candidate_id, task.iteration, task.attempt_commit)
+                ] = (
+                    task.assessment.hindsight_feedback,
+                    task.assessment_ref,
+                )
         return self._adaptive_search.project_action_context(
             graph,
             records,
             source_node_id,
             view_descriptions=view_descriptions,
+            value_feedback=value_feedback,
         )
 
     def get_global_evidence(self, agent_session_id: str) -> list[dict[str, Any]]:
@@ -2530,8 +2560,30 @@ class FileSearchRuntime:
                 hypothesis=hypothesis,
                 toolization_decision=toolization_decision,
             )
+            if (
+                scope == "process"
+                and agent_session_id is not None
+                and report.value_task_id is not None
+            ):
+                task = self._load_evidence_value_task(
+                    run_id,
+                    candidate_id,
+                    len(self._load_candidate_record(run_id, candidate_id).iterations),
+                )
+                if (
+                    task is not None
+                    and task.barrier_recommendation is not None
+                    and task.barrier_recommendation.mode
+                    == "await_through_current"
+                ):
+                    report = self._resolve_value_barrier(
+                        run_id,
+                        candidate_id,
+                        task.iteration,
+                    )
         if scope == "process" and agent_session_id is not None:
             self._kick_evidence_annotator(run_id)
+            self._kick_value_agent(run_id)
         return report
 
     def _run_verifier(
@@ -3058,8 +3110,12 @@ class FileSearchRuntime:
             iteration.ledger_git_head = ledger_git_head
             iteration.workspace_git_head_after_settlement = ledger_git_head
             allocation_decision: AllocationDecision | None = None
+            value_task: EvidenceValueTask | None = None
             adaptive_spec = frozen.spec.strategy.adaptive_search
-            if adaptive_spec is not None:
+            deferred_reward = (
+                adaptive_spec is not None and is_deferred_reward(adaptive_spec)
+            )
+            if adaptive_spec is not None and not deferred_reward:
                 verifier_elapsed_seconds = sum(
                     float(elapsed)
                     for result in report.verifier_results
@@ -3087,7 +3143,43 @@ class FileSearchRuntime:
             record.iterations.append(iteration)
             # Persist the settlement before writing its derived projections.
             self._write_candidate_record(run_id, record)
-            if adaptive_spec is not None:
+            if deferred_reward:
+                try:
+                    for unsettled_iteration in record.iterations:
+                        if (
+                            unsettled_iteration.iteration
+                            <= record.value_settlement_watermark
+                        ):
+                            continue
+                        pending_task = self._load_evidence_value_task(
+                            run_id,
+                            candidate_id,
+                            unsettled_iteration.iteration,
+                        )
+                        if pending_task is None:
+                            pending_task = self._create_evidence_value_task_locked(
+                                run,
+                                frozen,
+                                record,
+                                unsettled_iteration,
+                            )
+                        unsettled_iteration.value_task_id = pending_task.task_id
+                        unsettled_iteration.value_status = pending_task.state
+                        if (
+                            unsettled_iteration.value_backup_error
+                            and unsettled_iteration.value_backup_error.startswith(
+                                "value task registration failed:"
+                            )
+                        ):
+                            unsettled_iteration.value_backup_error = None
+                        if unsettled_iteration.iteration == iteration_number:
+                            value_task = pending_task
+                except Exception as exc:
+                    iteration.value_status = "terminal_error"
+                    iteration.value_backup_error = (
+                        f"value task registration failed: {type(exc).__name__}: {exc}"
+                    )
+            elif adaptive_spec is not None:
                 try:
                     backup_event = self._settle_value_backups_locked(
                         run,
@@ -3101,6 +3193,7 @@ class FileSearchRuntime:
                     iteration.value_backup_error = f"{type(exc).__name__}: {exc}"
             if (
                 adaptive_spec is not None
+                and not deferred_reward
                 and agent_session_id is not None
                 and iteration.value_backup_error is None
             ):
@@ -3143,6 +3236,8 @@ class FileSearchRuntime:
                     "toolization_decision": iteration.toolization_decision,
                     "toolization_advisories": iteration.toolization_advisories,
                     "reward_evaluation": iteration.reward_evaluation,
+                    "value_status": iteration.value_status,
+                    "value_task_id": iteration.value_task_id,
                     "allocation_decision": allocation_decision,
                 }
             )
@@ -6600,6 +6695,758 @@ class FileSearchRuntime:
 
     def _candidate_dir(self, run_id: str, candidate_id: str) -> Path:
         return self._run_dir(run_id) / "candidates" / candidate_id
+
+    def _evidence_value_task_path(
+        self,
+        run_id: str,
+        candidate_id: str,
+        iteration: int,
+    ) -> Path:
+        return (
+            self._candidate_dir(run_id, candidate_id)
+            / "value-evaluations"
+            / f"iteration-{iteration:04d}.json"
+        )
+
+    def _load_evidence_value_task(
+        self,
+        run_id: str,
+        candidate_id: str,
+        iteration: int,
+    ) -> EvidenceValueTask | None:
+        path = self._evidence_value_task_path(run_id, candidate_id, iteration)
+        if not path.exists():
+            return None
+        return EvidenceValueTask.model_validate(load_json(path))
+
+    def _write_evidence_value_task(self, task: EvidenceValueTask) -> None:
+        write_json(
+            self._evidence_value_task_path(
+                task.run_id,
+                task.candidate_id,
+                task.iteration,
+            ),
+            task.model_dump(mode="json"),
+        )
+
+    def _load_evidence_value_tasks(
+        self,
+        run_id: str,
+        candidate_id: str | None = None,
+    ) -> list[EvidenceValueTask]:
+        pattern = (
+            f"candidates/{candidate_id}/value-evaluations/iteration-*.json"
+            if candidate_id is not None
+            else "candidates/*/value-evaluations/iteration-*.json"
+        )
+        return [
+            EvidenceValueTask.model_validate(load_json(path))
+            for path in sorted(self._run_dir(run_id).glob(pattern))
+        ]
+
+    def _value_agent_run_active(self, run_id: str) -> bool:
+        run = self._load_run(run_id)
+        return (
+            run.invalidated_at is None
+            and run.state in VALUE_AGENT_RUN_STATES
+        )
+
+    def _resolve_value_agent_profile(
+        self,
+        frozen: FrozenSpec,
+        configured: EvidenceLLMValueParams,
+        *,
+        selected_model: str | None,
+    ) -> tuple[ResolvedStructuredModelProfile | None, str | None]:
+        strategy = frozen.spec.strategy
+        value_host = configured.host or strategy.worker_host
+        worker_launch = strategy.worker_launch
+        model = configured.model
+        if model is None and value_host == strategy.worker_host:
+            model = selected_model or (
+                worker_launch.model if worker_launch is not None else None
+            )
+        if model is None and value_host == "pi-rpc":
+            model = (os.environ.get("PI_MODEL") or "").strip() or None
+
+        reasoning_effort = configured.reasoning_effort
+        if (
+            reasoning_effort is None
+            and value_host == strategy.worker_host
+            and worker_launch is not None
+        ):
+            reasoning_effort = worker_launch.reasoning_effort
+
+        pi_provider: str | None = None
+        if value_host == "pi-rpc":
+            pi_provider = configured.pi_provider or (
+                (os.environ.get("PI_PROVIDER") or "").strip() or None
+            )
+            if model and "/" in model:
+                model_provider, _, model_id = model.partition("/")
+                if not model_provider or not model_id:
+                    return None, f"invalid Pi Value model reference {model!r}"
+                if pi_provider is not None and pi_provider != model_provider:
+                    return None, (
+                        "Pi Value provider conflicts with its model reference: "
+                        f"{pi_provider!r} != {model_provider!r}"
+                    )
+                pi_provider = model_provider
+
+        provider: ResolvedCodexProvider | None = None
+        if value_host == "codex" and configured.pi_provider is not None:
+            return None, "evidence_llm_value.pi_provider configures Pi only"
+        if value_host == "pi-rpc" and configured.provider is not None:
+            return None, "evidence_llm_value.provider configures Codex only"
+        if value_host == "codex" and configured.provider is not None:
+            provider = ResolvedCodexProvider(
+                provider_id=configured.provider.provider_id,
+                name=configured.provider.name,
+                base_url=configured.provider.base_url,
+                api_key_env=configured.provider.api_key_env,
+                wire_api=configured.provider.wire_api,
+            )
+
+        codex_home = os.environ.get("CODEX_HOME") if value_host == "codex" else None
+        pi_home = (
+            os.environ.get("PI_CODING_AGENT_DIR")
+            if value_host == "pi-rpc"
+            else None
+        )
+        return (
+            ResolvedStructuredModelProfile(
+                host=value_host,
+                model=model,
+                pi_provider=pi_provider,
+                reasoning_effort=reasoning_effort,
+                timeout_seconds=configured.timeout_seconds,
+                codex_home=(
+                    str(Path(codex_home).expanduser().resolve())
+                    if codex_home
+                    else None
+                ),
+                pi_home=(
+                    str(Path(pi_home).expanduser().resolve())
+                    if pi_home
+                    else None
+                ),
+                provider=provider,
+            ),
+            None,
+        )
+
+    def _refresh_adaptive_projections_locked(
+        self,
+        run: RunRecord,
+        frozen: FrozenSpec,
+        records: list[CandidateRecord],
+        *,
+        created_at: str,
+    ) -> tuple[SearchGraphProjection, ValueProjection]:
+        adaptive_spec = frozen.spec.strategy.adaptive_search
+        if adaptive_spec is None:
+            raise RuntimeError("adaptive projections require adaptive_search")
+        graph = self._adaptive_search.project(
+            run.run_id,
+            records,
+            created_at=created_at,
+        )
+        values = self._adaptive_search.replay_values(
+            adaptive_spec,
+            graph,
+            records,
+            self._load_value_backup_events(run.run_id),
+        )
+        self._write_search_graph_projection(graph)
+        self._write_value_projection(values)
+        return graph, values
+
+    def _create_evidence_value_task_locked(
+        self,
+        run: RunRecord,
+        frozen: FrozenSpec,
+        record: CandidateRecord,
+        iteration: IterationRecord,
+    ) -> EvidenceValueTask:
+        adaptive_spec = frozen.spec.strategy.adaptive_search
+        if adaptive_spec is None or not is_deferred_reward(adaptive_spec):
+            raise RuntimeError("Value task requires deferred reward configuration")
+        if iteration.git_head is None or iteration.attempt_base_git_head is None:
+            raise RuntimeError("Value task requires exact attempt commits")
+        configured = EvidenceLLMValueParams.model_validate(
+            adaptive_spec.reward.params
+        )
+        config_hash = adaptive_component_hash(
+            adaptive_spec.reward.name,
+            adaptive_spec.reward.version,
+            adaptive_spec.reward.params,
+        )
+        existing = self._load_evidence_value_task(
+            run.run_id,
+            record.candidate_id,
+            iteration.iteration,
+        )
+        if existing is not None:
+            if (
+                existing.attempt_commit != iteration.git_head
+                or existing.attempt_base_commit != iteration.attempt_base_git_head
+                or existing.evaluator_config_hash != config_hash
+            ):
+                raise RuntimeError("Evidence Value task identity is immutable")
+            return existing
+
+        records = self._load_candidate_records(run.run_id)
+        records = [
+            record if item.candidate_id == record.candidate_id else item
+            for item in records
+        ]
+        graph, values = self._refresh_adaptive_projections_locked(
+            run,
+            frozen,
+            records,
+            created_at=iteration.created_at,
+        )
+        transition = next(
+            (
+                item
+                for item in graph.transitions
+                if item.candidate_id == record.candidate_id
+                and item.iteration == iteration.iteration
+            ),
+            None,
+        )
+        if transition is None:
+            raise RuntimeError("Value task has no hard-settled search transition")
+
+        try:
+            profile, profile_error = self._resolve_value_agent_profile(
+                frozen,
+                configured,
+                selected_model=iteration.selected_model,
+            )
+        except Exception as exc:
+            profile = None
+            profile_error = f"invalid Value profile: {type(exc).__name__}: {exc}"
+        outer_deadline = os.environ.get(OUTER_DEADLINE_ENV) or None
+        if outer_deadline:
+            deadline_epoch = self._outer_deadline_epoch(outer_deadline)
+            if deadline_epoch is None:
+                profile_error = f"invalid {OUTER_DEADLINE_ENV} value"
+                profile = None
+            elif deadline_epoch <= time.time():
+                profile_error = "Value outer deadline already expired"
+                profile = None
+        task_context, task_context_source, task_context_ref = (
+            self._evidence_task_context(
+                run.run_id,
+                fallback=frozen.spec.objective,
+            )
+        )
+        digest = sha256_text(
+            "\0".join(
+                (
+                    run.run_id,
+                    record.candidate_id,
+                    str(iteration.iteration),
+                    iteration.git_head,
+                    config_hash,
+                )
+            )
+        )[:16]
+        now = utc_timestamp()
+        task = EvidenceValueTask(
+            task_id=f"value_{record.candidate_id}_{iteration.iteration:04d}_{digest}",
+            run_id=run.run_id,
+            candidate_id=record.candidate_id,
+            iteration=iteration.iteration,
+            attempt_base_commit=iteration.attempt_base_git_head,
+            attempt_commit=iteration.git_head,
+            attempt_changed_files=list(iteration.attempt_changed_files),
+            parent_node_id=transition.from_node_id,
+            task_context_source=task_context_source,
+            task_context_ref=task_context_ref,
+            task_context_sha256=sha256_text(task_context),
+            evaluator_name=adaptive_spec.reward.name,
+            evaluator_version=adaptive_spec.reward.version,
+            evaluator_config_hash=config_hash,
+            profile=profile,
+            outer_deadline_at=outer_deadline,
+            state="terminal_error" if profile_error else "pending",
+            error_fingerprint=(sha256_text(profile_error) if profile_error else None),
+            last_error=profile_error,
+            created_at=now,
+            updated_at=now,
+        )
+        self._write_evidence_value_task(task)
+
+        tasks = [
+            item
+            for item in self._load_evidence_value_tasks(
+                run.run_id,
+                record.candidate_id,
+            )
+            if item.iteration > record.value_settlement_watermark
+            and item.consumed_at is None
+        ]
+        oldest = min(
+            (parse_utc_timestamp(item.created_at) for item in tasks),
+            default=time.time(),
+        )
+        decisions = self._load_allocation_decisions(run.run_id)
+        max_candidates = frozen.spec.budget.max_candidates
+        if max_candidates is None:
+            raise RuntimeError("adaptive Value allocation requires max_candidates")
+        resources = self._adaptive_search.project_resources(
+            adaptive_spec,
+            graph,
+            records,
+            decisions,
+            max_candidates=max_candidates,
+        )
+        recommendation = self._adaptive_search.recommend_value_barrier(
+            AllocationContext(
+                adaptive_spec=adaptive_spec,
+                trigger_record=record,
+                records=records,
+                graph=graph,
+                values=values,
+                resources=resources,
+            ),
+            PendingValueState(
+                pending_count=len(tasks),
+                oldest_pending_age_seconds=max(0.0, time.time() - oldest),
+                through_iteration=iteration.iteration,
+                created_at=now,
+            ),
+        )
+        task = task.model_copy(update={"barrier_recommendation": recommendation})
+        self._write_evidence_value_task(task)
+        return task
+
+    def _eligible_evidence_value_tasks(
+        self,
+        run_id: str,
+        candidate_id: str | None = None,
+        *,
+        through_iteration: int | None = None,
+        now_epoch: float | None = None,
+    ) -> list[tuple[str, int]]:
+        if not self._value_agent_run_active(run_id):
+            return []
+        now_epoch = time.time() if now_epoch is None else now_epoch
+        eligible: list[tuple[str, int]] = []
+        for task in self._load_evidence_value_tasks(run_id, candidate_id):
+            if through_iteration is not None and task.iteration > through_iteration:
+                continue
+            if task.state not in {"pending", "retry_wait"}:
+                continue
+            deadline = self._outer_deadline_epoch(task.outer_deadline_at)
+            retry_at = self._outer_deadline_epoch(task.next_attempt_at)
+            if deadline is not None and deadline <= now_epoch:
+                continue
+            if retry_at is not None and retry_at > now_epoch:
+                continue
+            eligible.append((task.candidate_id, task.iteration))
+        return sorted(eligible, key=lambda item: (item[0], item[1]))
+
+    def _evidence_value_context(
+        self,
+        run_id: str,
+        candidate_id: str,
+        iteration_number: int,
+    ) -> dict[str, Any]:
+        run = self._load_run(run_id)
+        frozen = self._load_frozen_spec(run.frozen_spec_id)
+        record = self._load_candidate_record(run_id, candidate_id)
+        iteration = next(
+            (
+                item
+                for item in record.iterations
+                if item.iteration == iteration_number
+                and item.agent_session_id is not None
+            ),
+            None,
+        )
+        task = self._load_evidence_value_task(
+            run_id,
+            candidate_id,
+            iteration_number,
+        )
+        if (
+            iteration is None
+            or iteration.git_head is None
+            or task is None
+            or task.profile is None
+        ):
+            raise RuntimeError("Value assessment requires a runnable exact task")
+        if (
+            task.attempt_commit != iteration.git_head
+            or task.attempt_base_commit != iteration.attempt_base_git_head
+            or task.attempt_changed_files != iteration.attempt_changed_files
+        ):
+            raise RuntimeError("Value task does not match hard-settled iteration")
+        for commit in (task.attempt_base_commit, task.attempt_commit):
+            if self._git_returncode(
+                record.task.workspace,
+                ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
+            ) != 0:
+                raise RuntimeError("Value task commit is unavailable")
+
+        actual_diff = ""
+        if task.attempt_changed_files:
+            actual_diff = self._git_output_bounded(
+                record.task.workspace,
+                [
+                    "git",
+                    "diff",
+                    "--full-index",
+                    "--no-ext-diff",
+                    "--function-context",
+                    "--unified=10",
+                    task.attempt_base_commit,
+                    task.attempt_commit,
+                    "--",
+                    *task.attempt_changed_files,
+                ],
+                max_bytes=MAX_EVIDENCE_ANNOTATION_DIFF_BYTES,
+            )
+        candidate_base_commit = (
+            record.task.workspace_base_revision or task.attempt_base_commit
+        )
+        candidate_changed_files = self._git_changed_files(
+            record.task.workspace,
+            candidate_base_commit,
+            task.attempt_commit,
+        )
+        candidate_diff = ""
+        if candidate_changed_files:
+            candidate_diff = self._git_output_bounded(
+                record.task.workspace,
+                [
+                    "git",
+                    "diff",
+                    "--full-index",
+                    "--no-ext-diff",
+                    "--function-context",
+                    "--unified=10",
+                    candidate_base_commit,
+                    task.attempt_commit,
+                    "--",
+                    *candidate_changed_files,
+                ],
+                max_bytes=MAX_EVIDENCE_ANNOTATION_DIFF_BYTES,
+            )
+        task_context, task_context_source, task_context_ref = (
+            self._evidence_task_context(
+                run_id,
+                fallback=frozen.spec.objective,
+            )
+        )
+        if (
+            task_context_source != task.task_context_source
+            or task_context_ref != task.task_context_ref
+            or sha256_text(task_context) != task.task_context_sha256
+        ):
+            raise RuntimeError("Value task context no longer matches its snapshot")
+        lineage = [
+            {
+                "iteration": item.iteration,
+                "attempt_commit": item.git_head,
+                "hypothesis": item.hypothesis,
+                "changed_files": item.attempt_changed_files,
+                "process_passed": item.process_passed,
+                "disposition": item.disposition,
+                "failure_class": item.failure_class,
+                "public_metrics": item.metrics,
+            }
+            for item in record.iterations
+            if item.iteration <= iteration_number
+        ]
+        return {
+            "run_id": run_id,
+            "candidate_id": candidate_id,
+            "iteration": iteration_number,
+            "objective": frozen.spec.objective,
+            "task_context": task_context,
+            "task_context_source": task_context_source,
+            "exact_attempt_commit": task.attempt_commit,
+            "attempt_base_commit": task.attempt_base_commit,
+            "changed_files": list(task.attempt_changed_files),
+            "actual_diff": actual_diff,
+            "candidate_base_commit": candidate_base_commit,
+            "candidate_changed_files": candidate_changed_files,
+            "candidate_diff": candidate_diff,
+            "lineage": lineage,
+            "verifier_contract": [
+                {
+                    "name": command.name,
+                    "role": str(command.role),
+                    "cwd": command.cwd,
+                    "timeout_seconds": command.timeout_seconds,
+                }
+                for command in frozen.spec.process_verifiers
+            ],
+            "input_limitations": [
+                "Only public process-verifier evidence is included.",
+                "Diffs are byte-bounded and may omit unchanged definitions.",
+                "Hidden fail-to-pass tests and final benchmark labels are absent.",
+            ],
+            "value_agent": task.profile.model_dump(mode="json"),
+            "outer_deadline_at": task.outer_deadline_at,
+            "runtime_root": str(self.root_dir),
+            "task_id": task.task_id,
+        }
+
+    def _consume_evidence_value_tasks(
+        self,
+        run_id: str,
+        candidate_id: str,
+        *,
+        through_iteration: int | None = None,
+        allow_allocation: bool = False,
+    ) -> AllocationDecision | None:
+        allocation_decision: AllocationDecision | None = None
+        with self._run_transaction(run_id):
+            if not self._value_agent_run_active(run_id):
+                return None
+            run = self._load_run(run_id)
+            frozen = self._load_frozen_spec(run.frozen_spec_id)
+            adaptive_spec = frozen.spec.strategy.adaptive_search
+            if adaptive_spec is None or not is_deferred_reward(adaptive_spec):
+                return None
+            record = self._load_candidate_record(run_id, candidate_id)
+            while True:
+                next_iteration = record.value_settlement_watermark + 1
+                if (
+                    through_iteration is not None
+                    and next_iteration > through_iteration
+                ):
+                    break
+                task = self._load_evidence_value_task(
+                    run_id,
+                    candidate_id,
+                    next_iteration,
+                )
+                if task is None or task.state not in {
+                    "completed",
+                    "terminal_error",
+                }:
+                    break
+                iteration = next(
+                    (
+                        item
+                        for item in record.iterations
+                        if item.iteration == next_iteration
+                    ),
+                    None,
+                )
+                if iteration is None or iteration.git_head != task.attempt_commit:
+                    raise RuntimeError(
+                        "Value task cannot bind to its hard-settled iteration"
+                    )
+                records = self._load_candidate_records(run_id)
+                records = [
+                    record if item.candidate_id == candidate_id else item
+                    for item in records
+                ]
+                graph = self._adaptive_search.project(
+                    run_id,
+                    records,
+                    created_at=iteration.created_at,
+                )
+                parent = next(
+                    (
+                        item
+                        for item in graph.nodes
+                        if item.node_id == task.parent_node_id
+                    ),
+                    None,
+                )
+                if parent is None:
+                    raise RuntimeError("Value task parent node is unavailable")
+                parent_value = parent.settled_value
+                if parent_value is None and parent.kind == "virtual_root":
+                    parent_value = 0.0
+                if parent_value is None:
+                    raise RuntimeError("Value task parent has no settled value")
+                reward_context = RewardContext(
+                    candidate_id=candidate_id,
+                    iteration=iteration.iteration,
+                    commit=iteration.git_head,
+                    process_passed=bool(iteration.process_passed),
+                    disposition=iteration.disposition or "failure",
+                    attempt_score=iteration.score,
+                    previous_best_score=None,
+                    metric_direction=frozen.spec.metric_direction,
+                    created_at=iteration.created_at,
+                    verifier_elapsed_seconds=0.0,
+                )
+                if task.state == "completed":
+                    if task.assessment is None or task.assessment_ref is None:
+                        raise RuntimeError("completed Value task has no assessment")
+                    reward = evaluate_evidence_llm_reward(
+                        adaptive_spec,
+                        reward_context,
+                        task.assessment,
+                        parent_value=parent_value,
+                        assessment_ref=task.assessment_ref,
+                        elapsed_seconds=(
+                            task.invocation.elapsed_seconds
+                            if task.invocation is not None
+                            else 0.0
+                        ),
+                        usage=task.usage,
+                    )
+                else:
+                    reward = evaluate_evidence_llm_error(
+                        adaptive_spec,
+                        reward_context,
+                        parent_value=parent_value,
+                        error=task.last_error or "Value Agent terminal error",
+                    )
+                iteration.reward_evaluation = reward
+                iteration.value_status = task.state
+                iteration.value_assessment_ref = task.assessment_ref
+                record.value_settlement_watermark = next_iteration
+                self._write_candidate_record(run_id, record)
+
+                backup_event: ValueBackupEvent | None = None
+                if reward.status == "evaluated":
+                    try:
+                        backup_event = self._settle_value_backups_locked(
+                            run,
+                            frozen,
+                            record,
+                            iteration,
+                        )
+                        if backup_event is not None:
+                            iteration.value_backup_event_id = backup_event.event_id
+                    except Exception as exc:
+                        iteration.value_backup_error = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                else:
+                    records = self._load_candidate_records(run_id)
+                    records = [
+                        record if item.candidate_id == candidate_id else item
+                        for item in records
+                    ]
+                    self._refresh_adaptive_projections_locked(
+                        run,
+                        frozen,
+                        records,
+                        created_at=iteration.created_at,
+                    )
+                task = task.model_copy(
+                    update={
+                        "reward_id": reward.reward_id,
+                        "value_backup_event_id": (
+                            backup_event.event_id
+                            if backup_event is not None
+                            else None
+                        ),
+                        "consumed_at": utc_timestamp(),
+                        "updated_at": utc_timestamp(),
+                    }
+                )
+                self._write_evidence_value_task(task)
+                self._write_candidate_record(run_id, record)
+
+            if allow_allocation and through_iteration is not None:
+                trigger = next(
+                    (
+                        item
+                        for item in record.iterations
+                        if item.iteration == through_iteration
+                    ),
+                    None,
+                )
+                if (
+                    trigger is not None
+                    and record.value_settlement_watermark >= through_iteration
+                    and trigger.reward_evaluation is not None
+                    and trigger.reward_evaluation.status == "evaluated"
+                    and trigger.value_backup_error is None
+                ):
+                    try:
+                        allocation_decision = (
+                            self._create_allocation_decision_locked(
+                                run,
+                                frozen,
+                                record,
+                                trigger,
+                            )
+                        )
+                    except Exception as exc:
+                        trigger.allocation_decision_error = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+
+            if record.score_report is not None and record.iterations:
+                latest = record.iterations[-1]
+                latest_task = self._load_evidence_value_task(
+                    run_id,
+                    candidate_id,
+                    latest.iteration,
+                )
+                record.score_report = record.score_report.model_copy(
+                    update={
+                        "reward_evaluation": latest.reward_evaluation,
+                        "value_status": (
+                            latest.value_status
+                            if latest.reward_evaluation is not None
+                            else latest_task.state if latest_task is not None else None
+                        ),
+                        "value_task_id": latest.value_task_id,
+                        "allocation_decision": (
+                            allocation_decision
+                            if latest.iteration == through_iteration
+                            else None
+                        ),
+                    }
+                )
+            self._write_candidate_record(run_id, record)
+            self._write_run(run)
+        return allocation_decision
+
+    def _resolve_value_barrier(
+        self,
+        run_id: str,
+        candidate_id: str,
+        through_iteration: int,
+    ) -> ScoreReport:
+        try:
+            from goal_plus.value_agent import resolve_candidate_values
+
+            resolve_candidate_values(
+                self.root_dir,
+                run_id,
+                candidate_id,
+                through_iteration=through_iteration,
+            )
+        except Exception:
+            # Value inference is fail-open; completed/terminal tasks are still
+            # consumed below and pending tasks remain durable for recovery.
+            pass
+        self._consume_evidence_value_tasks(
+            run_id,
+            candidate_id,
+            through_iteration=through_iteration,
+            allow_allocation=True,
+        )
+        record = self._load_candidate_record(run_id, candidate_id)
+        if record.score_report is None:
+            raise RuntimeError("candidate has no verifier report after Value barrier")
+        return record.score_report
+
+    def _kick_value_agent(self, run_id: str) -> None:
+        try:
+            from goal_plus.value_agent import kick_value_agent
+
+            kick_value_agent(self.root_dir, run_id)
+        except Exception:
+            # Lazy Value never changes the hard verifier settlement outcome.
+            return
 
     def _evidence_annotation_task_path(
         self,

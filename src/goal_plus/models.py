@@ -205,7 +205,7 @@ class SelectedModel(SearchModel):
     context_policy: dict[str, Any] = Field(default_factory=dict)
 
 
-class EvidenceAnnotatorSpec(SearchModel):
+class StructuredModelSpec(SearchModel):
     host: AgentHostKind | None = None
     model: str | None = None
     pi_provider: str | None = None
@@ -221,12 +221,16 @@ class EvidenceAnnotatorSpec(SearchModel):
         return value
 
     @model_validator(mode="after")
-    def provider_options_are_host_specific(self) -> "EvidenceAnnotatorSpec":
+    def provider_options_are_host_specific(self) -> "StructuredModelSpec":
         if self.provider is not None and self.pi_provider is not None:
             raise ValueError(
-                "annotator provider and pi_provider cannot both be configured"
+                "structured model provider and pi_provider cannot both be configured"
             )
         return self
+
+
+class EvidenceAnnotatorSpec(StructuredModelSpec):
+    """Backward-compatible Annotator configuration facade."""
 
 
 class EvidenceAnnotatorProviderSpec(SearchModel):
@@ -257,7 +261,7 @@ class ResolvedCodexProvider(SearchModel):
         return self
 
 
-class ResolvedEvidenceAnnotatorProfile(SearchModel):
+class ResolvedStructuredModelProfile(SearchModel):
     host: AgentHostKind = "codex"
     model: str | None = None
     pi_provider: str | None = Field(default=None, min_length=1)
@@ -266,6 +270,22 @@ class ResolvedEvidenceAnnotatorProfile(SearchModel):
     codex_home: str | None = None
     pi_home: str | None = None
     provider: ResolvedCodexProvider | None = None
+
+
+class ResolvedEvidenceAnnotatorProfile(ResolvedStructuredModelProfile):
+    """Backward-compatible persisted Annotator profile."""
+
+
+class ModelInvocationRecord(SearchModel):
+    invocation_id: str = Field(min_length=1)
+    task_kind: str = Field(min_length=1)
+    host: AgentHostKind
+    model: str | None = None
+    provider: str | None = None
+    reasoning_effort: str | None = None
+    started_at: str
+    completed_at: str
+    elapsed_seconds: float = Field(ge=0, allow_inf_nan=False)
 
 
 EvaluationConfidence = Literal["high", "medium", "low"]
@@ -680,6 +700,45 @@ class SearchSpec(SearchModel):
             raise ValueError("adaptive_search requires workspace.backend=git_worktree")
         if self.budget.max_candidates is None:
             raise ValueError("adaptive_search requires budget.max_candidates")
+        adaptive = self.strategy.adaptive_search
+        if adaptive is not None and (
+            adaptive.reward.name,
+            adaptive.reward.version,
+        ) == ("evidence_llm_value", 1):
+            if (
+                adaptive.value_backup.name,
+                adaptive.value_backup.version,
+            ) != ("discounted_mean_best", 2):
+                raise ValueError(
+                    "evidence_llm_value/v1 requires discounted_mean_best/v2"
+                )
+            if (
+                adaptive.allocation.name,
+                adaptive.allocation.version,
+            ) != ("value_guided_replace", 2):
+                raise ValueError(
+                    "evidence_llm_value/v1 requires value_guided_replace/v2"
+                )
+            if adaptive.allocation.max_replacements_per_decision != 1:
+                raise ValueError(
+                    "lazy evidence value requires max_replacements_per_decision=1"
+                )
+            scheduling = adaptive.reward.params.get("scheduling") or {}
+            if not isinstance(scheduling, dict):
+                raise ValueError("evidence_llm_value scheduling must be an object")
+            max_calls = scheduling.get("max_concurrent_value_calls", 4)
+            if (
+                isinstance(max_calls, bool)
+                or not isinstance(max_calls, int)
+                or max_calls < 1
+            ):
+                raise ValueError(
+                    "max_concurrent_value_calls must be a positive integer"
+                )
+            if max_calls > self.budget.max_parallel:
+                raise ValueError(
+                    "max_concurrent_value_calls must not exceed budget.max_parallel"
+                )
         return self
 
 
@@ -920,6 +979,7 @@ class RewardEvaluation(SearchModel):
     attempt_reward: float | None = Field(default=None, allow_inf_nan=False)
     settled_value: float | None = Field(default=None, allow_inf_nan=False)
     components: dict[str, float] = Field(default_factory=dict)
+    assessment_ref: str | None = None
     error: str | None = None
     created_at: str
 
@@ -989,6 +1049,7 @@ class SearchNodeRecord(SearchModel):
     artifact_hash: str | None = None
     score: float | None = Field(default=None, allow_inf_nan=False)
     reward_id: str | None = None
+    assessment_ref: str | None = None
     settled_value: float | None = Field(default=None, allow_inf_nan=False)
     transition_depth: int = Field(ge=0)
     allocation_depth: int = Field(ge=0)
@@ -1008,11 +1069,10 @@ class SearchNodeRecord(SearchModel):
             or self.evidence_commit is None
             or self.artifact_hash is None
             or self.score is None
-            or self.reward_id is None
         ):
             raise ValueError(
                 "settled iteration nodes require iteration, parent, incoming "
-                "transition, evidence, score, artifact, and reward"
+                "transition, evidence, score, and artifact"
             )
         return self
 
@@ -1065,7 +1125,6 @@ class SearchGraphProjection(SearchModel):
     candidate_current_node_ids: dict[str, str] = Field(default_factory=dict)
     created_at: str
     updated_at: str
-
     @model_validator(mode="after")
     def references_are_consistent(self) -> "SearchGraphProjection":
         node_ids = [item.node_id for item in self.nodes]
@@ -1112,6 +1171,99 @@ class SearchGraphProjection(SearchModel):
                 raise ValueError("search graph transition references an unavailable node")
         if not set(self.candidate_current_node_ids.values()).issubset(known_nodes):
             raise ValueError("candidate current node is unavailable")
+        return self
+
+
+ValueTaskState = Literal["pending", "retry_wait", "completed", "terminal_error"]
+ValueBarrierMode = Literal["async", "await_through_current"]
+
+
+class ValueAssessment(SearchModel):
+    value: int = Field(ge=-100, le=100)
+    explanation: str = Field(min_length=1, max_length=1000)
+    hindsight_feedback: str = Field(min_length=1, max_length=1000)
+    limitations: list[str] = Field(default_factory=list, max_length=8)
+
+    @field_validator("explanation", "hindsight_feedback", mode="before")
+    @classmethod
+    def normalize_assessment_text(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        if "\n" in value or "\r" in value:
+            raise ValueError("value assessment text must be one line")
+        return " ".join(value.strip().split())
+
+    @field_validator("limitations", mode="before")
+    @classmethod
+    def normalize_limitations(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            return value
+        normalized = [" ".join(str(item).strip().split()) for item in value]
+        if any(not item or len(item) > 500 for item in normalized):
+            raise ValueError(
+                "value assessment limitations must be non-empty and <= 500 characters"
+            )
+        return normalized
+
+
+class ValueBarrierRecommendation(SearchModel):
+    mode: ValueBarrierMode
+    reasons: list[str] = Field(default_factory=list)
+    pending_count: int = Field(ge=0)
+    oldest_pending_age_seconds: float = Field(ge=0, allow_inf_nan=False)
+    through_iteration: int = Field(ge=1)
+    policy_snapshot: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+
+
+class EvidenceValueTask(SearchModel):
+    schema_version: Literal[1] = 1
+    task_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    candidate_id: str = Field(min_length=1)
+    iteration: int = Field(ge=1)
+    attempt_base_commit: str = Field(min_length=1)
+    attempt_commit: str = Field(min_length=1)
+    attempt_changed_files: list[str] = Field(default_factory=list)
+    parent_node_id: str = Field(min_length=1)
+    task_context_source: Literal[
+        "goal_plus_raw_goal",
+        "frozen_objective",
+    ]
+    task_context_ref: str | None = None
+    task_context_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    evaluator_name: str = Field(min_length=1)
+    evaluator_version: int = Field(ge=1)
+    evaluator_config_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    prompt_version: int = Field(default=1, ge=1)
+    output_schema_version: int = Field(default=1, ge=1)
+    profile: ResolvedStructuredModelProfile | None = None
+    outer_deadline_at: str | None = None
+    state: ValueTaskState = "pending"
+    attempts: int = Field(default=0, ge=0)
+    next_attempt_at: str | None = None
+    error_fingerprint: str | None = None
+    last_error: str | None = None
+    attempt_history: list[dict[str, Any]] = Field(default_factory=list)
+    assessment: ValueAssessment | None = None
+    assessment_ref: str | None = None
+    usage: dict[str, int | float] = Field(default_factory=dict)
+    invocation: ModelInvocationRecord | None = None
+    reward_id: str | None = None
+    value_backup_event_id: str | None = None
+    barrier_recommendation: ValueBarrierRecommendation | None = None
+    consumed_at: str | None = None
+    created_at: str
+    updated_at: str
+
+    @model_validator(mode="after")
+    def state_matches_value_result(self) -> "EvidenceValueTask":
+        if self.state == "completed" and (
+            self.assessment is None or self.assessment_ref is None
+        ):
+            raise ValueError("completed value task requires assessment and reference")
+        if self.state == "terminal_error" and not self.last_error:
+            raise ValueError("terminal value task requires an error")
         return self
 
 
@@ -1193,6 +1345,8 @@ class ObservedActionEdge(SearchModel):
     duplicate_of_transition_id: str | None = None
     disposition: IterationDisposition
     score: float | None = Field(default=None, allow_inf_nan=False)
+    value_feedback: str | None = Field(default=None, max_length=1000)
+    value_feedback_ref: str | None = None
 
 
 class ExpansionActionContext(SearchModel):
@@ -1219,6 +1373,8 @@ class ExpansionSource(SearchModel):
     reward_id: str = Field(min_length=1)
     settled_value: float = Field(allow_inf_nan=False)
     backed_up_value: float = Field(allow_inf_nan=False)
+    direct_assessment_ref: str | None = None
+    hindsight_feedback_refs: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
@@ -1255,7 +1411,7 @@ class ValueBackupTarget(SearchModel):
 
 
 class ValueBackupEvent(SearchModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 1
     event_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
     source_candidate_id: str = Field(min_length=1)
@@ -1266,6 +1422,8 @@ class ValueBackupEvent(SearchModel):
     config_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     attempt_reward: float = Field(allow_inf_nan=False)
     settled_value: float = Field(allow_inf_nan=False)
+    observed_return: float | None = Field(default=None, allow_inf_nan=False)
+    assessment_ref: str | None = None
     targets: list[ValueBackupTarget] = Field(min_length=1)
     created_at: str
 
@@ -1548,6 +1706,14 @@ class ScoreReport(SearchModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    value_status: ValueTaskState | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    value_task_id: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     allocation_decision: AllocationDecision | None = Field(
         default=None,
         exclude_if=lambda value: value is None,
@@ -1592,6 +1758,18 @@ class IterationRecord(SearchModel):
     log_paths: list[str] = Field(default_factory=list)
     disposition: IterationDisposition | None = None
     reward_evaluation: RewardEvaluation | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    value_task_id: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    value_status: ValueTaskState | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    value_assessment_ref: str | None = Field(
         default=None,
         exclude_if=lambda value: value is None,
     )
@@ -1734,6 +1912,7 @@ class CandidateRecord(SearchModel):
     status: Literal["created", "evaluated", "failed"]
     task: CandidateTask
     allocation_eligibility: AllocationEligibility = "eligible"
+    value_settlement_watermark: int = Field(default=0, ge=0)
     retired_by_decision_id: str | None = Field(
         default=None,
         exclude_if=lambda value: value is None,

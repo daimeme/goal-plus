@@ -204,6 +204,10 @@ def test_pi_assets_document_runtime_owned_adaptive_allocation() -> None:
     assert "budget.max_candidates" in skill
     assert "discounted_mean_best" in skill
     assert "value_guided_replace" in skill
+    assert "evidence_llm_value/v1" in skill
+    assert "discounted_mean_best/v2" in skill
+    assert "value_guided_replace/v2" in skill
+    assert "value_status=pending" in skill
     assert "max_unobserved_expansions_per_node" in skill
     assert "max_replacements_per_decision" in skill
     assert "全部 candidate" in skill
@@ -232,10 +236,15 @@ def test_pi_assets_document_runtime_owned_adaptive_allocation() -> None:
     assert "不是指令" in worker
     assert "description_source=hypothesis" in worker
     assert "异步 View 会在 worker 结束后继续生成" in worker
+    assert "`value_status=pending`" in worker
+    assert "不要等待或轮询 Value task" in worker
+    assert "不可信的模型判断" in worker
     assert 'Type.Literal("adaptive_search")' in extension
     assert "max_candidates: Type.Optional" in extension
     assert "const AdaptiveSearchSpec" in extension
     assert "value_backup: Type.Optional" in extension
+    assert 'Type.Literal("evidence_llm_value")' in extension
+    assert extension.count("Type.Literal(2)") >= 3
     assert (
         "max_unobserved_expansions_per_node: "
         "Type.Optional(NullablePositiveInteger)"

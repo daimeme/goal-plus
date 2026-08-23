@@ -90,6 +90,15 @@ workspace:
 reward、value backup 或 allocation 的 name/version 分支；对所有 runtime 已注册并通过 freeze
 校验的组件组合，都只消费 runtime 返回的持久化 `allocation_decision`。
 
+SWE-bench 这类 hard score 只有 Pass/Fail、但需要过程搜索价值时，可显式使用
+`evidence_llm_value/v1`、`discounted_mean_best/v2` 和 `value_guided_replace/v2`。该组合要求
+`max_replacements_per_decision=1`；reward params 中的 `scheduling` 配置
+`max_pending_per_candidate`、`max_reward_staleness_seconds` 和
+`max_concurrent_value_calls`，且 Value 并发不能超过 `budget.max_parallel`。Value Agent 只读取
+准确 commit/diff、公开 verifier Evidence 和 lineage，不读取或推断 hidden benchmark 结果。
+hard settlement 先持久化；健康路径返回 `value_status=pending` 并异步有序回填 reward/backup，
+只有 runtime 的 near-prune barrier 才等待到当前 iteration 并允许 allocation。
+
 `max_parallel` 是任一时刻的 live worker 上限，`max_candidates` 是整个 run 可物化的唯一
 candidate 上限。reward evaluator 在 verifier 结算后只读取当前尝试；allocation policy 在同一
 run transaction 中读取已持久化的全局候选/node 状态。组件都按 name/version 注册并可替换。
@@ -136,6 +145,8 @@ retirement 只 fence 下一轮 candidate iteration。触发 decision 的当前 i
 Git/results ledger 结算；annotation task 无论在 decision 前还是 retirement 后注册，都绑定同一条
 Evidence。停止 worker 不会取消 annotator，也不会从 Global Evidence 删除该结果。task 尚未注册或
 View 生成期间允许 `view=null`，父 agent 和 worker 都不等待或轮询 View。
+`value_status=pending` 同样不是 worker 或父 agent 的等待条件；不要轮询 Value task。只有同一次
+verifier 返回非空 `allocation_decision` 时才执行上述 fence/apply/派生流程。
 
 `search_select` 和 promotion 仍只使用硬 verifier score；reward 只用于 allocation，backed value
 只用于 source priority。未返回

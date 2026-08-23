@@ -206,6 +206,11 @@ def test_codex_assets_document_runtime_owned_adaptive_allocation() -> None:
     assert "spawn_agent" in skill
     assert "reward 只用于 allocation" in skill
     assert "metric_progress/v2" in skill
+    assert "evidence_llm_value/v1" in skill
+    assert "discounted_mean_best/v2" in skill
+    assert "value_guided_replace/v2" in skill
+    assert "value_status=pending" in skill
+    assert "near-prune barrier" in skill
     assert "ValueBackupEvent" in skill
     assert "AllocationStateSnapshot" in skill
     assert "max_unobserved_expansions_per_node" in skill
@@ -236,6 +241,9 @@ def test_codex_assets_document_runtime_owned_adaptive_allocation() -> None:
     assert "description_source=hypothesis" in worker
     assert "异步 View 会在" in worker
     assert "进入 Global Evidence" in worker
+    assert "`value_status=pending`" in worker
+    assert "不要等待或轮询 Value task" in worker
+    assert "不可信的模型判断" in worker
 
 
 def test_codex_search_skill_documents_worker_budget_watchdog() -> None:

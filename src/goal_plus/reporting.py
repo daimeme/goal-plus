@@ -15,6 +15,7 @@ from goal_plus.models import (
     AgentSessionRecord,
     CandidateRecord,
     EvidenceAnnotationTask,
+    EvidenceValueTask,
     FrozenSpec,
     GoalPlusRecord,
     IterationRecord,
@@ -1317,6 +1318,25 @@ def _report_iteration_payload(
         if annotation is not None and annotation.state == "completed"
         else None
     )
+    value_task_path = (
+        run_dir
+        / "candidates"
+        / candidate_id
+        / "value-evaluations"
+        / f"iteration-{iteration.iteration:04d}.json"
+    )
+    value_task = (
+        EvidenceValueTask.model_validate(load_json(value_task_path))
+        if value_task_path.exists()
+        else None
+    )
+    if value_task is not None and (
+        value_task.run_id != run_id
+        or value_task.candidate_id != candidate_id
+        or value_task.iteration != iteration.iteration
+        or value_task.attempt_commit != iteration.git_head
+    ):
+        raise RuntimeError("evidence Value task does not match iteration")
     if view is not None and (
         view.run_id != run_id
         or view.candidate_id != candidate_id
@@ -1397,6 +1417,14 @@ def _report_iteration_payload(
                 if iteration.reward_evaluation is not None
                 else None
             ),
+            "value_task": (
+                value_task.model_dump(mode="json")
+                if value_task is not None
+                else None
+            ),
+            "value_status": iteration.value_status,
+            "value_task_id": iteration.value_task_id,
+            "value_assessment_ref": iteration.value_assessment_ref,
             "value_backup_event_id": iteration.value_backup_event_id,
             "value_backup_error": iteration.value_backup_error,
             "allocation_decision_id": iteration.allocation_decision_id,
@@ -1560,6 +1588,9 @@ def _task_details(
                     current_value.model_dump(mode="json")
                     if current_value is not None
                     else None
+                ),
+                "value_settlement_watermark": (
+                    candidate.value_settlement_watermark
                 ),
             })
         candidate_payloads.append(candidate_payload)
@@ -1751,6 +1782,12 @@ def _task_details(
         "sessions": session_payloads,
     }
     if adaptive_search_enabled:
+        value_tasks = [
+            EvidenceValueTask.model_validate(load_json(path))
+            for path in sorted(
+                run_dir.glob("candidates/*/value-evaluations/iteration-*.json")
+            )
+        ]
         allocation_decisions = [
             load_json(path)
             for path in sorted(
@@ -1766,6 +1803,9 @@ def _task_details(
         task_payload.update({
             "allocation_decisions": allocation_decisions,
             "value_backups": value_backups,
+            "value_tasks": [
+                task.model_dump(mode="json") for task in value_tasks
+            ],
             "search_graph": (
                 graph.model_dump(mode="json") if graph is not None else None
             ),
@@ -3772,6 +3812,7 @@ def _render_shared_evidence_view(task: dict[str, Any]) -> str:
                 f'<div class="evidence-score-kind">{_html(item.get("score_kind"))}</div>'
             )
         reward = item.get("reward_evaluation")
+        value_task = item.get("value_task")
         reward_copy = "Not observed"
         if isinstance(reward, dict):
             attempt_reward = reward.get("attempt_reward", reward.get("reward"))
@@ -3788,6 +3829,18 @@ def _render_shared_evidence_view(task: dict[str, Any]) -> str:
                 reward_copy += f" | {_text(item.get('allocation_decision_id'))}"
             elif item.get("allocation_decision_error"):
                 reward_copy += " | policy error"
+        if isinstance(value_task, dict):
+            assessment = value_task.get("assessment")
+            value_summary = f"Value {value_task.get('state') or 'unknown'}"
+            if isinstance(assessment, dict):
+                value_summary += (
+                    f" {assessment.get('value')} | "
+                    f"{assessment.get('explanation') or 'no explanation'}"
+                )
+            if isinstance(reward, dict):
+                reward_copy += f" | {value_summary}"
+            else:
+                reward_copy = value_summary
         reward_cell = (
             f'<td class="mono">{_html(reward_copy)}</td>'
             if adaptive_enabled

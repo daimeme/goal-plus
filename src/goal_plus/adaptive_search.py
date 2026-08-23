@@ -5,17 +5,19 @@ from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import math
-from typing import Protocol
+from typing import Literal, Protocol
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from goal_plus.models import (
     AdaptiveSearchSpec,
+    AgentHostKind,
     AllocationDecision,
     AllocationSourceSnapshot,
     AllocationStateSnapshot,
     CandidateRecord,
     EdgeValueEstimate,
+    EvidenceAnnotatorProviderSpec,
     ExpansionActionContext,
     ExpansionSource,
     IterationRecord,
@@ -26,6 +28,8 @@ from goal_plus.models import (
     SearchModel,
     SearchNodeRecord,
     SearchTransitionRecord,
+    ValueAssessment,
+    ValueBarrierRecommendation,
     ValueProjection,
     ValueBackupEvent,
     ValueBackupTarget,
@@ -70,6 +74,41 @@ class ValueGuidedReplaceParams(SearchModel):
     )
 
 
+class ValueGuidedReplaceV2Params(ValueGuidedReplaceParams):
+    barrier_guard: float = Field(default=0.1, ge=0, allow_inf_nan=False)
+
+
+class LazyValueSchedulingParams(SearchModel):
+    mode: Literal["lazy_near_prune"] = "lazy_near_prune"
+    max_pending_per_candidate: int = Field(default=1, ge=1, le=64)
+    max_reward_staleness_seconds: float = Field(
+        default=180.0,
+        gt=0,
+        allow_inf_nan=False,
+    )
+    max_concurrent_value_calls: int = Field(default=4, ge=1, le=64)
+
+
+class EvidenceLLMValueParams(SearchModel):
+    host: AgentHostKind | None = None
+    model: str | None = None
+    pi_provider: str | None = None
+    reasoning_effort: str | None = None
+    timeout_seconds: int = Field(default=180, gt=0, le=1800)
+    provider: EvidenceAnnotatorProviderSpec | None = None
+    scheduling: LazyValueSchedulingParams = Field(
+        default_factory=LazyValueSchedulingParams
+    )
+
+    @model_validator(mode="after")
+    def provider_options_are_host_specific(self) -> "EvidenceLLMValueParams":
+        if self.provider is not None and self.pi_provider is not None:
+            raise ValueError(
+                "Value provider and pi_provider cannot both be configured"
+            )
+        return self
+
+
 class IdentityValueBackupParams(SearchModel):
     pass
 
@@ -81,6 +120,11 @@ class DiscountedMeanBestBackupParams(SearchModel):
         ge=0,
         allow_inf_nan=False,
     )
+    best_weight: float = Field(default=0.25, ge=0, le=1, allow_inf_nan=False)
+
+
+class DiscountedMeanBestBackupV2Params(SearchModel):
+    discount: float = Field(default=0.9, gt=0, le=1, allow_inf_nan=False)
     best_weight: float = Field(default=0.25, ge=0, le=1, allow_inf_nan=False)
 
 
@@ -144,9 +188,18 @@ class AllocationReservationPlan:
 class ValueBackupContext:
     run_id: str
     trigger_record: CandidateRecord
+    trigger_iteration: int
     records: list[CandidateRecord]
     graph: SearchGraphProjection
     reward: RewardEvaluation
+    created_at: str
+
+
+@dataclass(frozen=True)
+class PendingValueState:
+    pending_count: int
+    oldest_pending_age_seconds: float
+    through_iteration: int
     created_at: str
 
 
@@ -197,6 +250,15 @@ class AllocationPolicy(Protocol):
         context: AllocationContext,
         params: dict[str, object],
     ) -> AllocationRecommendation | None: ...
+
+
+class DeferredRewardAllocationPolicy(AllocationPolicy, Protocol):
+    def barrier(
+        self,
+        context: AllocationContext,
+        pending: PendingValueState,
+        params: dict[str, object],
+    ) -> ValueBarrierRecommendation: ...
 
 
 class ValueBackupOperator(Protocol):
@@ -427,6 +489,124 @@ class MetricProgressRewardV2Evaluator:
         )
 
 
+class EvidenceLLMValueEvaluator:
+    """Deferred evaluator; the Value Agent supplies the assessment later."""
+
+    name = "evidence_llm_value"
+    version = 1
+
+    def validate_params(self, params: dict[str, object]) -> None:
+        EvidenceLLMValueParams.model_validate(params)
+
+    def evaluate(
+        self,
+        context: RewardContext,
+        params: dict[str, object],
+        *,
+        config_hash: str,
+    ) -> RewardEvaluation:
+        raise RuntimeError(
+            "evidence_llm_value is deferred and requires a ValueAssessment"
+        )
+
+
+def evidence_llm_value_params(
+    adaptive_spec: AdaptiveSearchSpec,
+) -> EvidenceLLMValueParams:
+    config = adaptive_spec.reward
+    if config.name != EvidenceLLMValueEvaluator.name or config.version != 1:
+        raise ValueError("adaptive reward is not evidence_llm_value/v1")
+    return EvidenceLLMValueParams.model_validate(config.params)
+
+
+def is_deferred_reward(adaptive_spec: AdaptiveSearchSpec) -> bool:
+    return (
+        adaptive_spec.reward.name == EvidenceLLMValueEvaluator.name
+        and adaptive_spec.reward.version == EvidenceLLMValueEvaluator.version
+    )
+
+
+def evaluate_evidence_llm_reward(
+    adaptive_spec: AdaptiveSearchSpec,
+    context: RewardContext,
+    assessment: ValueAssessment,
+    *,
+    parent_value: float,
+    assessment_ref: str,
+    elapsed_seconds: float,
+    usage: Mapping[str, int | float],
+) -> RewardEvaluation:
+    evidence_llm_value_params(adaptive_spec)
+    config_hash = adaptive_component_hash(
+        adaptive_spec.reward.name,
+        adaptive_spec.reward.version,
+        adaptive_spec.reward.params,
+    )
+    attempt_value = assessment.value / 100.0
+    settled_value = (
+        attempt_value
+        if context.disposition in {"keep", "retain"}
+        else parent_value
+    )
+    components: dict[str, float] = {
+        "attempt_value": attempt_value,
+        "parent_value": parent_value,
+        "value_elapsed_seconds": max(0.0, elapsed_seconds),
+    }
+    for name, raw_value in usage.items():
+        if (
+            isinstance(raw_value, (int, float))
+            and not isinstance(raw_value, bool)
+            and math.isfinite(float(raw_value))
+        ):
+            components[f"value_usage_{name}"] = float(raw_value)
+    return RewardEvaluation(
+        reward_id=_reward_id(context, config_hash),
+        evaluator_name=adaptive_spec.reward.name,
+        evaluator_version=adaptive_spec.reward.version,
+        config_hash=config_hash,
+        status="evaluated",
+        attempt_reward=attempt_value - parent_value,
+        settled_value=settled_value,
+        components=components,
+        assessment_ref=assessment_ref,
+        created_at=context.created_at,
+    )
+
+
+def evaluate_evidence_llm_error(
+    adaptive_spec: AdaptiveSearchSpec,
+    context: RewardContext,
+    *,
+    parent_value: float,
+    error: str,
+) -> RewardEvaluation:
+    evidence_llm_value_params(adaptive_spec)
+    config_hash = adaptive_component_hash(
+        adaptive_spec.reward.name,
+        adaptive_spec.reward.version,
+        adaptive_spec.reward.params,
+    )
+    return RewardEvaluation(
+        reward_id=_reward_id(context, config_hash),
+        evaluator_name=adaptive_spec.reward.name,
+        evaluator_version=adaptive_spec.reward.version,
+        config_hash=config_hash,
+        status="error",
+        settled_value=parent_value,
+        components={"parent_value": parent_value},
+        error=error,
+        created_at=context.created_at,
+    )
+
+
+def _reward_id(context: RewardContext, config_hash: str) -> str:
+    digest = hashlib.sha256(
+        (context.commit + config_hash).encode("utf-8")
+    ).hexdigest()[:12]
+    return f"reward_{context.candidate_id}_{context.iteration:04d}_{digest}"
+
+
 class LowRewardReplacePolicy:
     name = "low_reward_replace"
     version = 1
@@ -607,6 +787,102 @@ class ValueGuidedReplacePolicy:
         )
 
 
+class ValueGuidedReplaceV2Policy(ValueGuidedReplacePolicy):
+    version = 2
+
+    def validate_params(self, params: dict[str, object]) -> None:
+        config = ValueGuidedReplaceV2Params.model_validate(params)
+        if config.window_size > config.min_attempts:
+            raise ValueError("allocation window_size must be <= min_attempts")
+
+    def decide(
+        self,
+        context: AllocationContext,
+        params: dict[str, object],
+    ) -> AllocationRecommendation | None:
+        config = ValueGuidedReplaceV2Params.model_validate(params)
+        return super().decide(
+            context,
+            config.model_dump(exclude={"barrier_guard"}),
+        )
+
+    def barrier(
+        self,
+        context: AllocationContext,
+        pending: PendingValueState,
+        params: dict[str, object],
+    ) -> ValueBarrierRecommendation:
+        config = ValueGuidedReplaceV2Params.model_validate(params)
+        scheduling = evidence_llm_value_params(
+            context.adaptive_spec
+        ).scheduling
+        evaluations = _evaluated_rewards(context.trigger_record)
+        recent_rewards = [
+            float(item.attempt_reward)
+            for item in evaluations[-config.window_size :]
+            if item.attempt_reward is not None
+        ]
+        total_evaluated = sum(
+            len(_evaluated_rewards(item)) for item in context.records
+        )
+        upper_bound: float | None = None
+        if recent_rewards:
+            recent_mean = sum(recent_rewards) / len(recent_rewards)
+            if len(recent_rewards) > 1:
+                variance = sum(
+                    (value - recent_mean) ** 2 for value in recent_rewards
+                ) / (len(recent_rewards) - 1)
+                standard_error = math.sqrt(variance / len(recent_rewards))
+            else:
+                standard_error = 0.0
+            exploration_bonus = config.exploration_weight * math.sqrt(
+                math.log(total_evaluated + 1.0) / max(1, len(evaluations))
+            )
+            upper_bound = (
+                recent_mean
+                + config.uncertainty_weight * standard_error
+                + exploration_bonus
+            )
+
+        reasons: list[str] = []
+        # The configured count is an async allowance. The first pending task is
+        # allowed to overlap worker work; the next task establishes a barrier.
+        if pending.pending_count > scheduling.max_pending_per_candidate:
+            reasons.append("pending_limit_exceeded")
+        if (
+            pending.oldest_pending_age_seconds
+            >= scheduling.max_reward_staleness_seconds
+        ):
+            reasons.append("reward_stale")
+        if len(evaluations) >= config.min_attempts:
+            reasons.append("fresh_value_required")
+        elif len(evaluations) == config.min_attempts - 1 and all(
+            value <= config.retire_threshold for value in recent_rewards
+        ):
+            reasons.append("next_low_reward_may_retire")
+        if (
+            upper_bound is not None
+            and upper_bound <= config.retire_threshold + config.barrier_guard
+        ):
+            reasons.append("lane_ucb_in_guard_band")
+
+        return ValueBarrierRecommendation(
+            mode="await_through_current" if reasons else "async",
+            reasons=reasons,
+            pending_count=pending.pending_count,
+            oldest_pending_age_seconds=pending.oldest_pending_age_seconds,
+            through_iteration=pending.through_iteration,
+            policy_snapshot={
+                "evaluated_attempts": len(evaluations),
+                "recent_attempt_rewards": recent_rewards,
+                "lane_upper_confidence_bound": upper_bound,
+                "retire_threshold": config.retire_threshold,
+                "barrier_guard": config.barrier_guard,
+            },
+            created_at=pending.created_at,
+        )
+
+
 class IdentityValueBackupOperator:
     name = "identity"
     version = 1
@@ -670,7 +946,7 @@ class DiscountedMeanBestBackupOperator:
         ):
             return None
 
-        source_iteration = context.trigger_record.iterations[-1].iteration
+        source_iteration = context.trigger_iteration
         transition = next(
             (
                 item
@@ -851,12 +1127,169 @@ class DiscountedMeanBestBackupOperator:
         return projection
 
 
+class DiscountedMeanBestBackupV2Operator(DiscountedMeanBestBackupOperator):
+    version = 2
+
+    def validate_params(self, params: dict[str, object]) -> None:
+        DiscountedMeanBestBackupV2Params.model_validate(params)
+
+    def create_event(
+        self,
+        context: ValueBackupContext,
+        params: dict[str, object],
+        *,
+        config_hash: str,
+    ) -> ValueBackupEvent | None:
+        config = DiscountedMeanBestBackupV2Params.model_validate(params)
+        reward = context.reward
+        attempt_value = reward.components.get("attempt_value")
+        if (
+            reward.status != "evaluated"
+            or reward.attempt_reward is None
+            or reward.settled_value is None
+            or attempt_value is None
+            or not math.isfinite(attempt_value)
+        ):
+            return None
+        transition = next(
+            (
+                item
+                for item in context.graph.transitions
+                if item.candidate_id == context.trigger_record.candidate_id
+                and item.iteration == context.trigger_iteration
+            ),
+            None,
+        )
+        if transition is None:
+            return None
+
+        nodes = {item.node_id: item for item in context.graph.nodes}
+        targets: list[ValueBackupTarget] = []
+        seen_nodes: set[str] = set()
+        source_node_id: str | None = transition.from_node_id
+        distance = 1
+        while source_node_id is not None and source_node_id not in seen_nodes:
+            seen_nodes.add(source_node_id)
+            node = nodes.get(source_node_id)
+            if node is None:
+                break
+            ancestor_value = node.settled_value
+            if ancestor_value is None and node.kind == "virtual_root":
+                ancestor_value = 0.0
+            if ancestor_value is not None:
+                targets.append(
+                    ValueBackupTarget(
+                        candidate_id=node.candidate_id,
+                        node_id=node.node_id,
+                        distance=distance,
+                        return_value=ancestor_value
+                        + (config.discount ** (distance - 1))
+                        * (attempt_value - ancestor_value),
+                    )
+                )
+            source_node_id = node.parent_node_id
+            distance += 1
+        if not targets:
+            return None
+
+        digest = hashlib.sha256(
+            (
+                context.run_id
+                + reward.reward_id
+                + config_hash
+                + "|".join(item.node_id for item in targets)
+            ).encode("utf-8")
+        ).hexdigest()[:12]
+        return ValueBackupEvent(
+            schema_version=2,
+            event_id=(
+                f"backup_{context.trigger_record.candidate_id}_"
+                f"{context.trigger_iteration:04d}_{digest}"
+            ),
+            run_id=context.run_id,
+            source_candidate_id=context.trigger_record.candidate_id,
+            source_iteration=context.trigger_iteration,
+            source_reward_id=reward.reward_id,
+            operator_name=self.name,
+            operator_version=self.version,
+            config_hash=config_hash,
+            attempt_reward=reward.attempt_reward,
+            settled_value=reward.settled_value,
+            observed_return=attempt_value,
+            assessment_ref=reward.assessment_ref,
+            targets=targets,
+            created_at=context.created_at,
+        )
+
+    def replay(
+        self,
+        graph: SearchGraphProjection,
+        records: list[CandidateRecord],
+        events: list[ValueBackupEvent],
+        params: dict[str, object],
+        *,
+        config_hash: str,
+    ) -> ValueProjection:
+        config = DiscountedMeanBestBackupV2Params.model_validate(params)
+        applicable = [
+            item
+            for item in events
+            if item.operator_name == self.name
+            and item.operator_version == self.version
+            and item.config_hash == config_hash
+        ]
+        missing = [item.event_id for item in applicable if item.observed_return is None]
+        if missing:
+            raise ValueError(
+                "v2 backup events require observed_return: " + ", ".join(missing)
+            )
+        replay_events = [
+            item.model_copy(
+                update={
+                    "settled_value": float(item.observed_return),
+                    "attempt_reward": 0.0,
+                }
+            )
+            for item in events
+        ]
+        projection = super().replay(
+            graph,
+            records,
+            replay_events,
+            {
+                "discount": config.discount,
+                "attempt_reward_weight": 0.0,
+                "best_weight": config.best_weight,
+            },
+            config_hash=config_hash,
+        )
+        event_coordinates = {
+            (item.source_candidate_id, item.source_iteration): item
+            for item in applicable
+        }
+        transitions = {
+            item.transition_id: item for item in graph.transitions
+        }
+        for edge in projection.edge_values:
+            transition = transitions[edge.transition_id]
+            event = event_coordinates.get(
+                (transition.candidate_id, transition.iteration)
+            )
+            edge.observed_return = (
+                float(event.observed_return) if event is not None else None
+            )
+        return projection
+
+
 _REWARD_EVALUATORS: dict[tuple[str, int], RewardEvaluator] = {
     (MetricProgressRewardEvaluator.name, MetricProgressRewardEvaluator.version): (
         MetricProgressRewardEvaluator()
     ),
     (MetricProgressRewardV2Evaluator.name, MetricProgressRewardV2Evaluator.version): (
         MetricProgressRewardV2Evaluator()
+    ),
+    (EvidenceLLMValueEvaluator.name, EvidenceLLMValueEvaluator.version): (
+        EvidenceLLMValueEvaluator()
     ),
 }
 _ALLOCATION_POLICIES: dict[tuple[str, int], AllocationPolicy] = {
@@ -865,6 +1298,9 @@ _ALLOCATION_POLICIES: dict[tuple[str, int], AllocationPolicy] = {
     ),
     (ValueGuidedReplacePolicy.name, ValueGuidedReplacePolicy.version): (
         ValueGuidedReplacePolicy()
+    ),
+    (ValueGuidedReplaceV2Policy.name, ValueGuidedReplaceV2Policy.version): (
+        ValueGuidedReplaceV2Policy()
     ),
 }
 _VALUE_BACKUP_OPERATORS: dict[tuple[str, int], ValueBackupOperator] = {
@@ -875,6 +1311,10 @@ _VALUE_BACKUP_OPERATORS: dict[tuple[str, int], ValueBackupOperator] = {
         DiscountedMeanBestBackupOperator.name,
         DiscountedMeanBestBackupOperator.version,
     ): DiscountedMeanBestBackupOperator(),
+    (
+        DiscountedMeanBestBackupV2Operator.name,
+        DiscountedMeanBestBackupV2Operator.version,
+    ): DiscountedMeanBestBackupV2Operator(),
 }
 
 
@@ -902,6 +1342,40 @@ def validate_adaptive_search_spec(spec: AdaptiveSearchSpec) -> None:
     backup.validate_params(spec.value_backup.params)
     policy = _allocation_policy(spec.allocation.name, spec.allocation.version)
     policy.validate_params(spec.allocation.params)
+    if is_deferred_reward(spec):
+        if (spec.value_backup.name, spec.value_backup.version) != (
+            "discounted_mean_best",
+            2,
+        ):
+            raise ValueError(
+                "evidence_llm_value/v1 requires discounted_mean_best/v2"
+            )
+        if (spec.allocation.name, spec.allocation.version) != (
+            "value_guided_replace",
+            2,
+        ):
+            raise ValueError(
+                "evidence_llm_value/v1 requires value_guided_replace/v2"
+            )
+        if spec.allocation.max_replacements_per_decision != 1:
+            raise ValueError(
+                "lazy evidence value requires max_replacements_per_decision=1"
+            )
+
+
+def recommend_value_barrier(
+    context: AllocationContext,
+    pending: PendingValueState,
+) -> ValueBarrierRecommendation:
+    config = context.adaptive_spec.allocation
+    policy = _allocation_policy(config.name, config.version)
+    barrier = getattr(policy, "barrier", None)
+    if not callable(barrier):
+        raise ValueError(
+            f"allocation policy does not support deferred reward: "
+            f"{config.name}/v{config.version}"
+        )
+    return barrier(context, pending, config.params)
 
 
 def evaluate_reward(
@@ -1309,6 +1783,7 @@ def project_search_graph(
                 kind="virtual_root",
                 candidate_id=record.candidate_id,
                 settled_commit=base_commit,
+                settled_value=0.0,
                 transition_depth=0,
                 allocation_depth=record.task.allocation_depth,
                 created_at=(
@@ -1375,6 +1850,9 @@ def project_search_graph(
                     artifact_hash=iteration.artifact_hash,
                     score=iteration.score,
                     reward_id=reward.reward_id if reward is not None else None,
+                    assessment_ref=(
+                        reward.assessment_ref if reward is not None else None
+                    ),
                     settled_value=(
                         reward.settled_value if reward is not None else None
                     ),
@@ -1441,6 +1919,9 @@ def project_expansion_action_context(
     source_node_id: str,
     *,
     view_descriptions: Mapping[tuple[str, int, str], str] | None = None,
+    value_feedback: Mapping[
+        tuple[str, int, str], tuple[str, str]
+    ] | None = None,
 ) -> ExpansionActionContext | None:
     """Join settled search facts into a derived worker's observed actions."""
 
@@ -1456,6 +1937,7 @@ def project_expansion_action_context(
         if iteration.agent_session_id is not None
     }
     descriptions = view_descriptions or {}
+    feedback = value_feedback or {}
     ordered_transitions = sorted(
         graph.transitions,
         key=lambda item: (
@@ -1492,6 +1974,7 @@ def project_expansion_action_context(
             else None
         )
         view_description = descriptions.get(view_key) if view_key is not None else None
+        feedback_item = feedback.get(view_key) if view_key is not None else None
         description = view_description or iteration.hypothesis or iteration.summary
         description = " ".join(description.strip().split())[:1000]
         if not description:
@@ -1514,6 +1997,10 @@ def project_expansion_action_context(
             duplicate_of_transition_id=duplicate_of,
             disposition=transition.disposition,
             score=transition.score,
+            value_feedback=(feedback_item[0] if feedback_item is not None else None),
+            value_feedback_ref=(
+                feedback_item[1] if feedback_item is not None else None
+            ),
         )
         actions_by_transition[transition.transition_id] = action
         ordered_actions.append(action)
@@ -1709,6 +2196,23 @@ def _source_options(
     options: list[_SourceOption] = []
     records_by_id = {item.candidate_id: item for item in records}
     values_by_id = {item.node_id: item for item in values.node_values}
+    assessment_refs_by_reward = {
+        iteration.reward_evaluation.reward_id: iteration.reward_evaluation.assessment_ref
+        for record in records
+        for iteration in record.iterations
+        if iteration.reward_evaluation is not None
+        and iteration.reward_evaluation.assessment_ref is not None
+    }
+    hindsight_refs_by_node: dict[str, list[str]] = {}
+    for transition in graph.transitions:
+        if transition.reward_id is None:
+            continue
+        assessment_ref = assessment_refs_by_reward.get(transition.reward_id)
+        if assessment_ref is None:
+            continue
+        refs = hindsight_refs_by_node.setdefault(transition.from_node_id, [])
+        if assessment_ref not in refs:
+            refs.append(assessment_ref)
     for node in graph.nodes:
         if node.kind != "settled_iteration" or node.iteration is None:
             continue
@@ -1751,6 +2255,8 @@ def _source_options(
             reward_id=node.reward_id,
             settled_value=node.settled_value,
             backed_up_value=value.backed_up_value,
+            direct_assessment_ref=node.assessment_ref,
+            hindsight_feedback_refs=hindsight_refs_by_node.get(node.node_id, []),
         )
         snapshot = AllocationSourceSnapshot(
             candidate_id=record.candidate_id,
@@ -1858,13 +2364,24 @@ class AdaptiveSearchEngine:
         source_node_id: str,
         *,
         view_descriptions: Mapping[tuple[str, int, str], str] | None = None,
+        value_feedback: Mapping[
+            tuple[str, int, str], tuple[str, str]
+        ] | None = None,
     ) -> ExpansionActionContext | None:
         return project_expansion_action_context(
             graph,
             records,
             source_node_id,
             view_descriptions=view_descriptions,
+            value_feedback=value_feedback,
         )
+
+    def recommend_value_barrier(
+        self,
+        context: AllocationContext,
+        pending: PendingValueState,
+    ) -> ValueBarrierRecommendation:
+        return recommend_value_barrier(context, pending)
 
     def project_resources(
         self,

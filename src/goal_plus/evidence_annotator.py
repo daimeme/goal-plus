@@ -26,6 +26,7 @@ from goal_plus.models import (
     SupplementalEvaluation,
     ToolViewRef,
     ToolViewRecord,
+    ResolvedStructuredModelProfile,
 )
 from goal_plus.runtime import (
     FileSearchRuntime,
@@ -35,6 +36,12 @@ from goal_plus.runtime import (
     utc_timestamp,
     utc_timestamp_from_epoch,
     write_json,
+)
+from goal_plus.structured_model import (
+    HostStructuredModelExecutor,
+    PermanentStructuredModelError,
+    StructuredModelError,
+    StructuredModelRequest,
 )
 
 
@@ -1250,22 +1257,95 @@ class PiEvidenceAnnotator:
             )
 
 
+class StructuredEvidenceAnnotator:
+    """Thin annotation consumer over the shared structured model executor."""
+
+    def __init__(self) -> None:
+        self._executor = HostStructuredModelExecutor(popen=subprocess.Popen)
+
+    def annotate(self, context: dict[str, Any]) -> EvidenceAnnotationResult:
+        diff_size = len(str(context["actual_diff"]).encode("utf-8"))
+        if diff_size > MAX_ANNOTATION_DIFF_BYTES:
+            raise PermanentAnnotationError(
+                f"actual diff is {diff_size} bytes; limit is "
+                f"{MAX_ANNOTATION_DIFF_BYTES}"
+            )
+        if not CodexEvidenceAnnotator._still_active(context):
+            raise PermanentAnnotationError("annotation run is closed or expired")
+        config = dict(context.get("annotator") or {})
+        try:
+            profile = ResolvedStructuredModelProfile.model_validate(config)
+            result = self._executor.execute(
+                StructuredModelRequest(
+                    task_kind="evidence_annotation",
+                    profile=profile,
+                    instructions=ANNOTATOR_INSTRUCTIONS,
+                    prompt=_annotation_prompt(context),
+                    output_schema=_strict_annotation_output_schema(),
+                    identity={
+                        "run_id": context.get("run_id"),
+                        "candidate_id": context.get("candidate_id"),
+                        "iteration": context.get("iteration"),
+                        "attempt": context.get("_annotation_attempt"),
+                    },
+                    timeout_seconds=profile.timeout_seconds,
+                    outer_deadline_at=context.get("outer_deadline_at"),
+                    pi_tool_name=PI_ANNOTATION_TOOL_NAME,
+                    pi_tool_label="Submit Evidence Annotation",
+                    pi_tool_description=(
+                        "Submit the final evidence annotation using the required schema."
+                    ),
+                    pi_output_env=PI_ANNOTATION_OUTPUT_ENV,
+                    monitor_path=(
+                        Path(str(context["_annotation_monitor_path"]))
+                        if context.get("_annotation_monitor_path")
+                        else None
+                    ),
+                    is_active=lambda: CodexEvidenceAnnotator._still_active(context),
+                )
+            )
+            output = EvidenceAnnotationOutput.model_validate(result.payload)
+            CodexEvidenceAnnotator._validate_supplemental_output(
+                output,
+                enabled=bool(context.get("supplemental_evaluation_enabled")),
+                comparison_basis=list(context.get("comparison_basis") or []),
+            )
+        except PermanentStructuredModelError as exc:
+            raise PermanentAnnotationError(str(exc), usage=exc.usage) from exc
+        except StructuredModelError as exc:
+            raise TransientAnnotationError(str(exc), usage=exc.usage) from exc
+        except AnnotationError:
+            raise
+        except ValueError as exc:
+            raise AnnotationOutputError(
+                f"invalid annotation output: {exc}"
+            ) from exc
+        return EvidenceAnnotationResult(
+            description=output.description,
+            tool_views=output.tool_views,
+            supplemental_evaluation=output.supplemental_evaluation,
+            comparison_basis=[
+                EvidenceComparisonReference.model_validate(item)
+                for item in context.get("comparison_basis") or []
+            ],
+            usage=result.usage,
+        )
+
+    def terminate(self) -> None:
+        self._executor.terminate()
+
+
 class HostEvidenceAnnotator:
     """Route one frozen annotation task through its Search worker host."""
 
     def __init__(self) -> None:
-        self._active: CodexEvidenceAnnotator | PiEvidenceAnnotator | None = None
+        self._active: StructuredEvidenceAnnotator | None = None
 
     def annotate(self, context: dict[str, Any]) -> EvidenceAnnotationResult:
         host = str((context.get("annotator") or {}).get("host") or "codex")
-        if host == "codex":
-            selected: CodexEvidenceAnnotator | PiEvidenceAnnotator = (
-                CodexEvidenceAnnotator()
-            )
-        elif host == "pi-rpc":
-            selected = PiEvidenceAnnotator()
-        else:
+        if host not in {"codex", "pi-rpc"}:
             raise PermanentAnnotationError(f"unsupported annotation host {host!r}")
+        selected = StructuredEvidenceAnnotator()
         self._active = selected
         try:
             return selected.annotate(context)

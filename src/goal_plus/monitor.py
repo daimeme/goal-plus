@@ -13,6 +13,7 @@ from goal_plus.models import (
     AgentSessionRecord,
     CandidateRecord,
     EvidenceAnnotationTask,
+    EvidenceValueTask,
     FrozenSpec,
     GoalPlusLinkedSearch,
     GoalPlusRecord,
@@ -147,6 +148,63 @@ def _evidence_annotation_payload(run_dir: Path) -> dict[str, Any]:
         "recent_attempts": visible,
         "monitor_files": len(attempts),
     }
+
+
+def _evidence_value_payload(
+    run_dir: Path,
+) -> tuple[dict[str, Any], dict[str, list[EvidenceValueTask]]]:
+    tasks: list[EvidenceValueTask] = []
+    for path in sorted(
+        run_dir.glob("candidates/*/value-evaluations/iteration-*.json")
+    ):
+        try:
+            tasks.append(EvidenceValueTask.model_validate(load_json(path)))
+        except (OSError, ValueError):
+            continue
+
+    states: dict[str, int] = {}
+    barrier_modes: dict[str, int] = {}
+    barrier_reasons: dict[str, int] = {}
+    usage: dict[str, int | float] = {}
+    by_candidate: dict[str, list[EvidenceValueTask]] = {}
+    pending_ages: list[float] = []
+    now = time.time()
+    for task in tasks:
+        states[task.state] = states.get(task.state, 0) + 1
+        by_candidate.setdefault(task.candidate_id, []).append(task)
+        if task.state in {"pending", "retry_wait"}:
+            created = _parse_utc_timestamp(task.created_at)
+            if created is not None:
+                pending_ages.append(max(0.0, now - created))
+        recommendation = task.barrier_recommendation
+        if recommendation is not None:
+            barrier_modes[recommendation.mode] = (
+                barrier_modes.get(recommendation.mode, 0) + 1
+            )
+            for reason in recommendation.reasons:
+                barrier_reasons[reason] = barrier_reasons.get(reason, 0) + 1
+        for key, value in task.usage.items():
+            if isinstance(value, int | float) and not isinstance(value, bool):
+                usage[key] = usage.get(key, 0) + value
+
+    for candidate_tasks in by_candidate.values():
+        candidate_tasks.sort(key=lambda item: item.iteration)
+    return (
+        {
+            "tasks": len(tasks),
+            "attempts": sum(task.attempts for task in tasks),
+            "states": dict(sorted(states.items())),
+            "pending": sum(
+                task.state in {"pending", "retry_wait"} for task in tasks
+            ),
+            "consumed": sum(task.consumed_at is not None for task in tasks),
+            "oldest_pending_age_seconds": max(pending_ages, default=None),
+            "barrier_modes": dict(sorted(barrier_modes.items())),
+            "barrier_reasons": dict(sorted(barrier_reasons.items())),
+            "usage": dict(sorted(usage.items())),
+        },
+        by_candidate,
+    )
 
 
 def _goal_metric_contexts(
@@ -830,6 +888,10 @@ def goal_plus_monitor_snapshot(
             "evidence_annotations": _evidence_annotation_payload(run_path),
         }
         if adaptive_search_enabled:
+            value_agent_payload, value_tasks_by_candidate = (
+                _evidence_value_payload(run_path)
+            )
+            run_payload["value_agent"] = value_agent_payload
             decision_paths = sorted(
                 (run_path / "allocation-decisions").glob("allocation_*.json")
             )
@@ -1027,6 +1089,13 @@ def goal_plus_monitor_snapshot(
                 "results_tsv": results_tsv,
             }
             if adaptive_search_enabled:
+                candidate_value_tasks = value_tasks_by_candidate.get(
+                    candidate.candidate_id,
+                    [],
+                )
+                last_value_task = (
+                    candidate_value_tasks[-1] if candidate_value_tasks else None
+                )
                 candidate_payload.update({
                     "allocation_depth": candidate.task.allocation_depth,
                     "allocation_eligibility": candidate.allocation_eligibility,
@@ -1074,6 +1143,19 @@ def goal_plus_monitor_snapshot(
                     "last_allocation_decision_error": (
                         last_iteration.allocation_decision_error
                         if last_iteration
+                        else None
+                    ),
+                    "value_settlement_watermark": (
+                        candidate.value_settlement_watermark
+                    ),
+                    "value_tasks_total": len(candidate_value_tasks),
+                    "value_tasks_pending": sum(
+                        item.state in {"pending", "retry_wait"}
+                        for item in candidate_value_tasks
+                    ),
+                    "last_value_task": (
+                        last_value_task.model_dump(mode="json")
+                        if last_value_task is not None
                         else None
                     ),
                 })

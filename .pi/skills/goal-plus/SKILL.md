@@ -162,6 +162,13 @@ hash 的重复尝试保留为独立边并标记重复。`parallel_loops`、初�
 `global_evidence_mode=independent` 不暴露该字段。配额为 1 时派生会在前一 child 首次结算后再
 继续；未来配额大于 1 时，若要求硬性阻止同时选择相近方向，仍需原子 action reservation。
 Pi worker 和 supervisor 都不计算或改写这些值。
+SWE-bench 这类 hard score 只有 Pass/Fail、但需要过程搜索价值时，可显式配置
+`evidence_llm_value/v1`、`discounted_mean_best/v2` 和 `value_guided_replace/v2`，并设置
+`max_replacements_per_decision=1`。Value Agent 只接收准确 commit/diff、公开 verifier Evidence
+和 lineage，不能读取或推断 hidden benchmark 结果。hard settlement 先持久化；正常返回可含
+`value_status=pending`，runtime 随后异步按 candidate iteration 顺序回填 reward/backup。
+只有 runtime 的 near-prune barrier 会等待到当前 iteration 并允许生成 allocation；Pi worker、
+main 和 supervisor 都不等待或轮询 Value task。
 decision 对外可见前，触发 iteration 的 Git/results ledger 已结算。annotation task 注册与
 reward/allocation 互不作为前置条件，缺失 task 会从已持久化 iteration 幂等补齐。
 retirement 只禁止该 candidate 的下一轮 iteration；结束 Pi worker 不会取消 annotator 或删除
