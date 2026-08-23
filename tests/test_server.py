@@ -186,6 +186,9 @@ def test_freeze_spec_exposes_complete_nested_search_spec_schema(tmp_path: Path) 
         for item in strategy["properties"]["adaptive_search"]["anyOf"]
         if item.get("type") == "object"
     )
+    allocation = adaptive["properties"]["allocation"]["properties"]
+    assert allocation["max_replacements_per_decision"]["default"] == 1
+    assert allocation["max_replacements_per_decision"]["minimum"] == 1
     expansion = adaptive["properties"]["expansion"]["properties"]
     quota = next(
         item

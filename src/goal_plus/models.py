@@ -514,6 +514,13 @@ class AllocationPolicySpec(SearchModel):
     name: str = Field(default="low_reward_replace", min_length=1)
     version: int = Field(default=1, ge=1)
     params: dict[str, Any] = Field(default_factory=dict)
+    max_replacements_per_decision: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "一次原子 allocation decision 最多退休并替换的 candidate 数量。"
+        ),
+    )
 
 
 class ValueBackupOperatorSpec(SearchModel):
@@ -1348,6 +1355,20 @@ class AllocationDecision(SearchModel):
     status: AllocationDecisionStatus = "pending"
     created_at: str
     applied_at: str | None = None
+
+    @model_validator(mode="after")
+    def allocation_actions_are_unique(self) -> "AllocationDecision":
+        action_ids = [action.action_id for action in self.actions]
+        if len(action_ids) != len(set(action_ids)):
+            raise ValueError("allocation action_id values must be unique")
+        child_ids = [
+            action.new_candidate_id
+            for action in self.actions
+            if action.kind == "expand_candidate"
+        ]
+        if len(child_ids) != len(set(child_ids)):
+            raise ValueError("allocation expansion candidate ids must be unique")
+        return self
 
 
 class CandidateTask(SearchModel):

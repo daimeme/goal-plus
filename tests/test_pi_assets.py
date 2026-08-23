@@ -205,6 +205,9 @@ def test_pi_assets_document_runtime_owned_adaptive_allocation() -> None:
     assert "discounted_mean_best" in skill
     assert "value_guided_replace" in skill
     assert "max_unobserved_expansions_per_node" in skill
+    assert "max_replacements_per_decision" in skill
+    assert "全部 candidate" in skill
+    assert "不能只启动第一项" in skill
     assert "expansion_action_context" in skill
     assert "source_path_actions" in skill
     assert "tried_actions" in skill
@@ -236,6 +239,9 @@ def test_pi_assets_document_runtime_owned_adaptive_allocation() -> None:
     assert (
         "max_unobserved_expansions_per_node: "
         "Type.Optional(NullablePositiveInteger)"
+    ) in extension
+    assert (
+        "max_replacements_per_decision: Type.Optional(PositiveInteger)"
     ) in extension
     assert "search_list_allocation_decisions: Type.Object" in extension
     assert "search_apply_allocation_decision: Type.Object" in extension

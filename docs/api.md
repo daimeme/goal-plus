@@ -82,7 +82,11 @@ lane UCB, source priority, and optional unobserved-expansion quota state.
 candidates from one source that may be awaiting their first verifier settlement.
 A persisted decision consumes the quota immediately; the child's first settlement
 releases it. This is an asynchronous exploration guard, not a lifetime branch
-limit. Legacy `reward` and `state_value` fields remain
+limit. `allocation.max_replacements_per_decision` defaults to one; larger values
+allow one persisted decision to reserve and return several retire/expand pairs
+against the same capacity and quota snapshot. Apply preflights the complete batch
+before materializing any candidate and returns one task/session payload per
+replacement. Legacy `reward` and `state_value` fields remain
 readable but are not written by new settlements.
 Before a decision becomes visible, its triggering iteration has completed Git
 and results-ledger settlement. Annotation task registration and reward/allocation
@@ -330,6 +334,7 @@ goal-plus-pi-tool goal_plus_monitor_snapshot \
 | `strategy.adaptive_search.reward` | registered reward evaluator name/version/params |
 | `strategy.adaptive_search.value_backup` | registered value-backup operator name/version/params |
 | `strategy.adaptive_search.allocation` | registered allocation policy name/version/params |
+| `strategy.adaptive_search.allocation.max_replacements_per_decision` | maximum retire/expand pairs atomically reserved by one decision; defaults to `1` |
 | `strategy.adaptive_search.expansion` | source/model policy, depth cap, and optional derived-worker budget |
 | `strategy.adaptive_search.expansion.max_unobserved_expansions_per_node` | per-source cap on derived candidates awaiting their first verifier settlement |
 | `strategy.worker_host` | maintained execution host: `pi-rpc` or `codex` |

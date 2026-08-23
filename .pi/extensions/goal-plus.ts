@@ -146,6 +146,7 @@ const AdaptiveSearchSpec = Type.Object(
 				])),
 				version: Type.Optional(Type.Literal(1)),
 				params: Type.Optional(LooseObject),
+				max_replacements_per_decision: Type.Optional(PositiveInteger),
 			},
 			{ additionalProperties: false },
 		)),
@@ -674,7 +675,7 @@ const RuntimeToolDescriptions: Record<string, string> = {
 	search_list_allocation_decisions:
 		"仅当当前 FrozenSpec 显式设置 orchestration_mode=adaptive_search 时，只读列出其持久化 allocation decisions；不启动、停止或继续 host worker。",
 	search_apply_allocation_decision:
-		"仅当当前 FrozenSpec 显式设置 orchestration_mode=adaptive_search 且 runtime 已返回准确 decision 时，幂等应用其剪枝与派生：保留 Evidence，物化派生 workspace，并创建 native session provenance。Pi 主 agent 只在可用执行配额内启动返回的 candidate。",
+		"仅当当前 FrozenSpec 显式设置 orchestration_mode=adaptive_search 且 runtime 已返回准确 decision 时，整批幂等应用其剪枝与派生：预检全部 action，保留 Evidence，物化所有派生 workspace，并创建 native session provenance。Pi 主 agent 只在足够执行配额内原样启动全部返回 candidate。",
 	search_invalidate_run:
 		"主 agent 确认 verifier 契约、覆盖范围、确定性、目标对齐或基础设施失败后，原子地隔离该 run。随后中断每个 host worker，等待 active worker 数归零，修复并重新冻结，再使用 source_run_id 创建后继项。",
 	search_report:

@@ -360,9 +360,10 @@ def create_mcp(
     ) -> dict[str, Any]:
         """仅当 FrozenSpec 显式启用 adaptive_search 时幂等应用准确决策。
 
-        runtime 保留被剪枝候选的 Evidence，物化派生 workspace，创建 agent-session
-        provenance 并返回 host launch payload。调用方仍须通过 Codex/Pi host 启动 worker
-        并绑定原生 handle；该工具不监督 worker 生命周期。
+        runtime 先预检 decision 中全部 replacement，再保留被剪枝候选的 Evidence、物化
+        所有派生 workspace、创建 agent-session provenance，并返回每个 replacement 的 host
+        launch payload。调用方仍须通过 Codex/Pi host 启动全部 worker 并绑定原生 handle；
+        该工具不监督 worker 生命周期。
         """
         return tools.search_apply_allocation_decision(run_id, decision_id)
 

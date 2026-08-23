@@ -72,7 +72,11 @@ strategy:
   adaptive_search:
     reward: {name: metric_progress, version: 2, params: {}}
     value_backup: {name: discounted_mean_best, version: 1, params: {}}
-    allocation: {name: value_guided_replace, version: 1, params: {}}
+    allocation:
+      name: value_guided_replace
+      version: 1
+      params: {}
+      max_replacements_per_decision: 2
     expansion:
       source_policy: highest_value
       model_policy: inherit_source
@@ -103,6 +107,9 @@ reward 的 UCB 决定退休，并把当时全部候选与 source priority 固定
 `max_unobserved_expansions_per_node` 可选地限制同一 source 同时派生但尚未完成首次 verifier
 结算的 candidate 数；pending decision 立即占用配额，首次结算后释放。它只改变 source 准入，
 不主动创建 slot，也不是永久分支宽度。
+`max_replacements_per_decision` 默认为 1；增大后，runtime 可把多个已经满足同一剪枝 policy 的
+candidate 放入一份原子 reservation，逐项扣减 candidate 容量和 source 配额，并持久化成多组
+retire/expand actions。它不扩大 `max_parallel`，也不允许主 agent 补写或拆分 decision。
 对于共享 Evidence 的 adaptive 派生 candidate，`search_get_agent_context` 还会动态投影
 `expansion_action_context`：`source_path_actions` 是到当前 source 的已接受路径，`tried_actions`
 是从该 source 已结算的尝试。边身份来自 `SearchGraphProjection`，描述优先使用已完成 View，
@@ -115,12 +122,15 @@ reward 的 UCB 决定退休，并把当时全部候选与 source priority 固定
 或改写这些值。
 
 当 worker verifier 返回 `allocation_decision` 时，当前 candidate 已被 runtime fence。父 agent
-完成该 worker 的终态绑定后，调用 `search_list_allocation_decisions(status="pending")`，再对准确
-decision 调用一次幂等的 `search_apply_allocation_decision`。只执行返回的 actions，不自行判断
-剪枝对象、派生来源、模型或预算。apply 会从 decision 固定的 verifier-backed source commit
-创建新 workspace，继承该 source 的 results ledger、run-global Evidence 可见性和 selected model，
-并返回新的 agent session 与 host-native launch payload。把该 payload 映射到 `spawn_agent`，绑定
-返回 handle，并保持 live worker 数不超过 `max_parallel`。
+读取 decision 的全部 `retire_candidate` actions，并通过 host-owned handle 让其中仍 live 的 worker
+结束或完成终态绑定；不得只处理触发 decision 的 worker，也不得 continue 已被 fence 的 peer。
+随后调用 `search_list_allocation_decisions(status="pending")`，再对准确 decision 调用一次幂等的
+`search_apply_allocation_decision`。只执行返回的 actions，不自行判断剪枝对象、派生来源、模型或
+预算。apply 会从 decision 固定的 verifier-backed source commit
+创建新 workspace，继承各 source 的 results ledger、run-global Evidence 可见性和 selected model，
+并返回每个 replacement 的 agent session 与 host-native launch payload。逐一把所有返回 payload
+映射到 `spawn_agent` 并绑定 handle；不能只启动数组第一项。只有全部 retired worker 的 live slot
+已经由 host 释放时才启动整批，且 live worker 总数不得超过 `max_parallel`。
 
 retirement 只 fence 下一轮 candidate iteration。触发 decision 的当前 iteration 必须先完成
 Git/results ledger 结算；annotation task 无论在 decision 前还是 retirement 后注册，都绑定同一条
@@ -192,8 +202,9 @@ allocation decision 时，继续规则与 `parallel_loops` 相同。
    - 只有出现具体评估契约或基础设施失败时才检查 `verifier_assessment`。诊断稀疏、
      分数低或没有改进不代表 verifier 不充分，也不会阻止继续。
 8. 验证后执行全局停止 policy。`adaptive_search` 下先处理报告中 runtime 已持久化的
-   allocation decision：不要恢复被退休的 worker；应用 decision 并在有 live slot 时启动返回的
-   派生 session。没有 decision 时再执行以下普通 continuation policy：
+   allocation decision：不要恢复任何 retire action 对应的 worker；应用 decision，并仅在全部
+   replacement 所需 live slots 都已释放时启动所有返回的派生 session。没有 decision 时再执行
+   以下普通 continuation policy：
    - 满足显式成功标准时停止恢复；
    - run 失效或用户停止时停止；
    - 外层剩余时间不足以容纳另一个 worker 轮次和最终收尾时停止；

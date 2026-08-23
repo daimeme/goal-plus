@@ -134,7 +134,7 @@ candidate/subagent 数。
 value-guided 组合为
 `reward={name: metric_progress, version: 2}`、
 `value_backup={name: discounted_mean_best, version: 1}`、
-`allocation={name: value_guided_replace, version: 1}` 和
+`allocation={name: value_guided_replace, version: 1, max_replacements_per_decision: 2}` 和
 `expansion={source_policy: highest_value, model_policy: inherit_source, max_depth: ...,
 max_unobserved_expansions_per_node: 1}`。
 兼容组合仍可使用 `metric_progress/v1`、`identity/v1` 和 `low_reward_replace/v1`；各组件
@@ -151,6 +151,9 @@ priority 固定在 decision snapshot 中。
 `max_unobserved_expansions_per_node` 限制同一 source 同时派生但尚未完成首次 verifier 结算的
 candidate 数；pending decision 立即占用，首次结算后释放。它不主动创建 slot，也不限制节点的
 永久分支宽度。
+`max_replacements_per_decision` 默认为 1；增大后，runtime 会在一份 decision 中原子预留多组
+retire/expand actions，并在每项选择后扣减同一份 candidate 容量和 source quota 投影。该配置
+不改变所有 pool 合计的 `max_parallel` 上限，Pi main 不得拆分或改写该批次。
 共享 Evidence 的 adaptive 派生 candidate 会在 `search_get_agent_context` 中按需收到
 `expansion_action_context`。runtime 从 `SearchGraphProjection` 与 settled iteration 动态生成
 `source_path_actions` 和同 source 的 `tried_actions`，用已完成 View 描述实际变化，View 未完成时
@@ -247,13 +250,16 @@ subagent 负责其候选工作区内的瓶颈分析、假设选择、特性迁�
    主 Pi 轮次中断后，使用 `pi_search_pool_snapshot(run_id=...)` 重新发现 pool；
    后续准确 snapshot 使用 `pool_id`。
    `adaptive_search` 中如果准确 iteration 已关联 allocation decision，不得 continue 被退休的
-   candidate。对该 decision 调用一次幂等的 `search_apply_allocation_decision`；只执行返回内容，
-   不自行改写剪枝、来源、模型或预算。apply 会从固定的 verifier-backed source commit 物化
+   candidate。读取 decision 的全部 `retire_candidate` actions；其中尚有 active pool job 时，
+   不得 continue 该 candidate，也不得提前启动 replacement，而应继续通过准确 pool snapshot/event
+   等待 host-owned slot 释放。对该 decision 调用一次幂等的 `search_apply_allocation_decision`；只执行
+   返回内容，不自行改写剪枝、来源、模型或预算。apply 会从固定的 verifier-backed source commit 物化
    workspace，继承 results ledger、run-global Evidence 可见性和 selected model，并创建 native
-   session provenance。统计所有已记录 pool 的 active jobs；仅当合计低于 `max_parallel` 时，
-   对返回的新 candidate 调用新的
-   `pi_search_pool_open(candidate_ids=[new_candidate_id], max_parallel=1, final_verify=true)`。
-   保存每个新 `pool_id` 并同等 wait/snapshot/close。不得恢复已退休 candidate，也不得增加
+   session provenance。统计所有已记录 pool 的 active jobs；仅当可用 slot 足以容纳本 decision
+   返回的全部 candidate 时，使用一次
+   `pi_search_pool_open(candidate_ids=[...all returned candidate ids...], max_parallel=<returned count>, final_verify=true)`
+   原样启动整批，不能只启动第一项或把一份原子 decision 拆成选择性子集。保存新 `pool_id` 并同等
+   wait/snapshot/close。不得恢复已退休 candidate，也不得增加
    手动 pool submit 工具或让 supervisor 自动补位。reward/policy 错误保持 fail-open，只记录
    iteration；`search_select` 始终按硬 verifier score，而不是 reward。
 9. 正常选择前等待准确 snapshot 的 `active_count=0`，再调用

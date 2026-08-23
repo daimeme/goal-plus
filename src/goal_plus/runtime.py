@@ -1187,6 +1187,62 @@ class FileSearchRuntime:
             if decision.run_id != run_id:
                 raise ValueError("allocation decision belongs to another run")
 
+            records = self._load_candidate_records(run_id)
+            records_by_id = {item.candidate_id: item for item in records}
+            missing_child_ids: set[str] = set()
+            for action in decision.actions:
+                if action.kind == "retire_candidate":
+                    assert action.candidate_id is not None
+                    retired = records_by_id.get(action.candidate_id)
+                    if retired is None:
+                        raise RuntimeError(
+                            f"allocation retire candidate is unavailable: "
+                            f"{action.candidate_id}"
+                        )
+                    if retired.retired_by_decision_id not in {None, decision_id}:
+                        raise RuntimeError(
+                            f"candidate {retired.candidate_id} was retired by "
+                            "another decision"
+                        )
+                    continue
+                if action.kind != "expand_candidate":
+                    continue
+                assert action.source is not None
+                assert action.new_candidate_id is not None
+                child_id = action.new_candidate_id
+                child = records_by_id.get(child_id)
+                if child is not None:
+                    if child.task.expansion_source != action.source:
+                        raise RuntimeError(
+                            f"candidate {child_id} does not match allocation decision"
+                        )
+                    continue
+                source_record = records_by_id.get(action.source.candidate_id)
+                if source_record is None:
+                    raise RuntimeError(
+                        f"allocation source candidate is unavailable: "
+                        f"{action.source.candidate_id}"
+                    )
+                if source_record.results_ledger_git_head is None:
+                    raise RuntimeError("expansion source has no settled results ledger")
+                if source_record.task.plan_id is None:
+                    raise RuntimeError("expansion source has no initial plan")
+                self._load_plan(run_id, source_record.task.plan_id)
+                self._source_ledger_at_revision(
+                    source_record,
+                    action.source.settled_commit,
+                )
+                missing_child_ids.add(child_id)
+
+            max_candidates = frozen.spec.budget.max_candidates
+            if (
+                max_candidates is not None
+                and len(records) + len(missing_child_ids) > max_candidates
+            ):
+                raise RuntimeError(
+                    "allocation decision would exceed budget.max_candidates"
+                )
+
             for action in decision.actions:
                 if action.kind == "retire_candidate":
                     assert action.candidate_id is not None
@@ -1353,8 +1409,22 @@ class FileSearchRuntime:
         )
         if existing is not None:
             iteration.allocation_decision_id = existing.decision_id
-            record.allocation_eligibility = "retired"
-            record.retired_by_decision_id = existing.decision_id
+            for action in existing.actions:
+                if action.kind != "retire_candidate":
+                    continue
+                assert action.candidate_id is not None
+                retired = (
+                    record
+                    if action.candidate_id == record.candidate_id
+                    else self._load_candidate_record(
+                        run.run_id,
+                        action.candidate_id,
+                    )
+                )
+                retired.allocation_eligibility = "retired"
+                retired.retired_by_decision_id = existing.decision_id
+                if retired is not record:
+                    self._write_candidate_record(run.run_id, retired)
             return existing
 
         graph = self._load_search_graph_projection(run.run_id)
@@ -1377,7 +1447,7 @@ class FileSearchRuntime:
             decisions,
             max_candidates=max_candidates,
         )
-        recommendation = self._adaptive_search.decide(
+        reservation = self._adaptive_search.decide(
             AllocationContext(
                 adaptive_spec=adaptive_spec,
                 trigger_record=record,
@@ -1387,14 +1457,41 @@ class FileSearchRuntime:
                 resources=resources,
             )
         )
-        if recommendation is None:
+        if reservation is None:
             return None
 
         decision_id = f"allocation_{run.next_allocation_decision_index:04d}"
         run.next_allocation_decision_index += 1
-        child_id = f"c{run.next_candidate_index:03d}"
-        run.next_candidate_index += 1
         policy = adaptive_spec.allocation
+        actions: list[AllocationAction] = []
+        for index, recommendation in enumerate(
+            reservation.recommendations,
+            start=1,
+        ):
+            child_id = f"c{run.next_candidate_index:03d}"
+            run.next_candidate_index += 1
+            action_prefix = f"{decision_id}:replacement:{index:02d}"
+            actions.extend(
+                (
+                    AllocationAction(
+                        action_id=f"{action_prefix}:retire",
+                        kind="retire_candidate",
+                        candidate_id=recommendation.retire_candidate_id,
+                        reason=recommendation.reason,
+                    ),
+                    AllocationAction(
+                        action_id=f"{action_prefix}:expand",
+                        kind="expand_candidate",
+                        source=recommendation.source,
+                        new_candidate_id=child_id,
+                        worker_budget=adaptive_spec.expansion.worker_budget,
+                        reason=(
+                            "replace the retired lane from the runtime-selected "
+                            "verifier-backed source"
+                        ),
+                    ),
+                )
+            )
         decision = AllocationDecision(
             decision_id=decision_id,
             run_id=run.run_id,
@@ -1405,32 +1502,21 @@ class FileSearchRuntime:
             policy_name=policy.name,
             policy_version=policy.version,
             config_hash=allocation_config_hash(adaptive_spec),
-            state_snapshot=recommendation.state_snapshot,
-            actions=[
-                AllocationAction(
-                    action_id=f"{decision_id}:retire",
-                    kind="retire_candidate",
-                    candidate_id=recommendation.retire_candidate_id,
-                    reason=recommendation.reason,
-                ),
-                AllocationAction(
-                    action_id=f"{decision_id}:expand",
-                    kind="expand_candidate",
-                    source=recommendation.source,
-                    new_candidate_id=child_id,
-                    worker_budget=adaptive_spec.expansion.worker_budget,
-                    reason=(
-                        "replace the retired lane from the runtime-selected "
-                        "verifier-backed source"
-                    ),
-                ),
-            ],
+            state_snapshot=reservation.recommendations[0].state_snapshot,
+            actions=actions,
             created_at=utc_timestamp(),
         )
-        record.allocation_eligibility = "retired"
-        record.retired_by_decision_id = decision_id
         iteration.allocation_decision_id = decision_id
+        # The durable decision is the reservation fact. Candidate fences are
+        # then idempotently projected from its retire actions under the same lock.
         self._write_allocation_decision(decision)
+        records_by_id = {item.candidate_id: item for item in records}
+        for recommendation in reservation.recommendations:
+            retired = records_by_id[recommendation.retire_candidate_id]
+            retired.allocation_eligibility = "retired"
+            retired.retired_by_decision_id = decision_id
+            if retired is not record:
+                self._write_candidate_record(run.run_id, retired)
         return decision
 
     def _settle_value_backups_locked(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import math
@@ -124,18 +124,20 @@ class AllocationResourceState:
 
 
 @dataclass(frozen=True)
-class AllocationReservationPlan:
-    """Reserved contract for future atomic allocation."""
-
-    reservation_keys: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
 class AllocationRecommendation:
     retire_candidate_id: str
     source: ExpansionSource
     reason: str
     state_snapshot: AllocationStateSnapshot | None = None
+
+
+@dataclass(frozen=True)
+class AllocationReservationPlan:
+    """One atomically admitted batch of candidate replacements."""
+
+    recommendations: tuple[AllocationRecommendation, ...]
+    reservation_keys: tuple[str, ...]
+    resources_after: AllocationResourceState
 
 
 @dataclass(frozen=True)
@@ -228,17 +230,17 @@ class AllocationConstraintEvaluator(Protocol):
     def validate(
         self,
         context: AllocationContext,
-        recommendation: AllocationRecommendation,
+        reservation: AllocationReservationPlan,
     ) -> None: ...
 
 
 class AllocationReservationPlanner(Protocol):
-    """Extension point for a future atomic allocation decision."""
+    """Atomically admit a batch against one allocation resource snapshot."""
 
     def plan(
         self,
         context: AllocationContext,
-        recommendation: AllocationRecommendation,
+        recommendations: tuple[AllocationRecommendation, ...],
     ) -> AllocationReservationPlan: ...
 
 
@@ -922,17 +924,148 @@ def evaluate_reward(
         )
 
 
-def decide_allocation(
+def _reserve_allocation_resources(
+    resources: AllocationResourceState,
+    source: ExpansionSource,
+) -> AllocationResourceState:
+    unobserved = dict(resources.unobserved_expansions_by_node)
+    unobserved[source.node_id] = unobserved.get(source.node_id, 0) + 1
+    remaining = dict(resources.exploration_quota_remaining_by_node)
+    if source.node_id in remaining:
+        remaining[source.node_id] = max(0, remaining[source.node_id] - 1)
+    return replace(
+        resources,
+        pending_expansions=resources.pending_expansions + 1,
+        unobserved_expansions_by_node=unobserved,
+        exploration_quota_remaining_by_node=remaining,
+    )
+
+
+def decide_allocation_batch(
     context: AllocationContext,
-) -> AllocationRecommendation | None:
+) -> tuple[AllocationRecommendation, ...]:
+    """Select a deterministic replacement batch from one resource snapshot."""
+
     config = context.adaptive_spec.allocation
     policy = _allocation_policy(config.name, config.version)
-    return policy.decide(context, config.params)
+    primary = policy.decide(context, config.params)
+    if primary is None:
+        return ()
+
+    recommendations = [primary]
+    resources = _reserve_allocation_resources(context.resources, primary.source)
+    if config.max_replacements_per_decision == 1:
+        return tuple(recommendations)
+
+    for record in sorted(context.records, key=lambda item: item.candidate_id):
+        if len(recommendations) >= config.max_replacements_per_decision:
+            break
+        if (
+            record.candidate_id == context.trigger_record.candidate_id
+            or record.allocation_eligibility != "eligible"
+        ):
+            continue
+        recommendation = policy.decide(
+            replace(
+                context,
+                trigger_record=record,
+                resources=resources,
+            ),
+            config.params,
+        )
+        if recommendation is None:
+            continue
+        recommendations.append(recommendation)
+        resources = _reserve_allocation_resources(
+            resources,
+            recommendation.source,
+        )
+    return tuple(recommendations)
+
+
+class AtomicAllocationReservationPlanner:
+    """Validate and reserve all resources for one replacement batch."""
+
+    def plan(
+        self,
+        context: AllocationContext,
+        recommendations: tuple[AllocationRecommendation, ...],
+    ) -> AllocationReservationPlan:
+        if not recommendations:
+            raise ValueError("atomic allocation requires at least one replacement")
+        maximum = context.adaptive_spec.allocation.max_replacements_per_decision
+        if len(recommendations) > maximum:
+            raise ValueError("atomic allocation exceeds the configured batch limit")
+
+        records = {record.candidate_id: record for record in context.records}
+        graph_nodes = {node.node_id: node for node in context.graph.nodes}
+        resources = context.resources
+        retired: set[str] = set()
+        reservation_keys: list[str] = []
+        for recommendation in recommendations:
+            candidate_id = recommendation.retire_candidate_id
+            if candidate_id in retired:
+                raise ValueError(
+                    f"candidate {candidate_id} appears twice in one allocation batch"
+                )
+            record = records.get(candidate_id)
+            if record is None or record.allocation_eligibility != "eligible":
+                raise ValueError(
+                    f"candidate {candidate_id} is not eligible for atomic allocation"
+                )
+            if (
+                resources.materialized_candidates
+                + resources.pending_expansions
+                >= resources.max_candidates
+            ):
+                raise ValueError("atomic allocation exceeds max_candidates")
+
+            source = recommendation.source
+            source_node = graph_nodes.get(source.node_id)
+            if (
+                source_node is None
+                or source_node.candidate_id != source.candidate_id
+                or source_node.iteration != source.iteration
+            ):
+                raise ValueError(
+                    f"allocation source {source.node_id} is not present in the graph"
+                )
+            if (
+                resources.exploration_quota_remaining_by_node.get(source.node_id)
+                == 0
+            ):
+                raise ValueError(
+                    f"allocation source {source.node_id} has no exploration quota"
+                )
+
+            retired.add(candidate_id)
+            reservation_keys.extend(
+                (
+                    f"candidate:{candidate_id}",
+                    f"source:{source.node_id}:{candidate_id}",
+                )
+            )
+            resources = _reserve_allocation_resources(resources, source)
+
+        return AllocationReservationPlan(
+            recommendations=recommendations,
+            reservation_keys=tuple(reservation_keys),
+            resources_after=resources,
+        )
 
 
 def allocation_config_hash(spec: AdaptiveSearchSpec) -> str:
     config = spec.allocation
-    return adaptive_component_hash(config.name, config.version, config.params)
+    return adaptive_component_hash(
+        config.name,
+        config.version,
+        {
+            "policy_params": config.params,
+            "max_replacements_per_decision": (
+                config.max_replacements_per_decision
+            ),
+        },
+    )
 
 
 def project_allocation_resources(
@@ -1571,7 +1704,9 @@ class AdaptiveSearchEngine:
         reservation_planner: AllocationReservationPlanner | None = None,
     ) -> None:
         self._constraint_evaluators = constraint_evaluators
-        self._reservation_planner = reservation_planner
+        self._reservation_planner = (
+            reservation_planner or AtomicAllocationReservationPlanner()
+        )
 
     def evaluate_reward(
         self,
@@ -1660,19 +1795,14 @@ class AdaptiveSearchEngine:
     def decide(
         self,
         context: AllocationContext,
-    ) -> AllocationRecommendation | None:
-        recommendation = decide_allocation(context)
-        if recommendation is None:
-            return None
-        for evaluator in self._constraint_evaluators:
-            evaluator.validate(context, recommendation)
-        return recommendation
-
-    def reserve(
-        self,
-        context: AllocationContext,
-        recommendation: AllocationRecommendation,
     ) -> AllocationReservationPlan | None:
-        if self._reservation_planner is None:
+        recommendations = decide_allocation_batch(context)
+        if not recommendations:
             return None
-        return self._reservation_planner.plan(context, recommendation)
+        reservation = self._reservation_planner.plan(
+            context,
+            recommendations,
+        )
+        for evaluator in self._constraint_evaluators:
+            evaluator.validate(context, reservation)
+        return reservation

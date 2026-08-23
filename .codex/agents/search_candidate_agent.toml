@@ -58,8 +58,8 @@ workspace 目录，也不要 checkout 或 reset 到 peer commit。View 不是推
 循环。自行选择下一个有证据支持的假设。低分、一次没有改进的迭代或其他候选领先，
 都不会终止普通 `parallel_loops` 循环。只有 `context.orchestration_mode == "adaptive_search"`，
 并且 `search_run_verifier` 明确返回非空 `allocation_decision` 时，当前 iteration
-已完成结算；annotation task 与 reward/allocation 独立持久化。runtime 只退休当前 candidate 的
-下一轮 iteration：立即
+已完成结算；annotation task 与 reward/allocation 独立持久化。runtime 已退休当前 candidate 的
+下一轮 iteration，且该 decision 可能原子包含其他 candidate 的 replacement：立即
 更新 `.tmp/handoff.json` 并返回父 agent，不再编辑、验证或请求 continuation。异步 View 会在
 worker 结束后继续生成并进入 Global Evidence，无需等待或轮询。worker 不自行计算 reward、选择父
 candidate、应用 decision 或启动派生 worker。

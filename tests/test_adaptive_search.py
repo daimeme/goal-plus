@@ -927,6 +927,135 @@ def test_exploration_quota_reserves_pending_source_until_child_is_observed(
     ] == 1
 
 
+def test_atomic_allocation_reserves_and_applies_multiple_replacements(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GOAL_PLUS_SUPPLEMENTAL_EVALUATION_ENABLED", "0")
+    project = make_project(tmp_path)
+    data = adaptive_spec(
+        project,
+        max_candidates=6,
+        max_parallel=3,
+    ).model_dump(mode="json")
+    adaptive = data["strategy"]["adaptive_search"]
+    adaptive["allocation"]["max_replacements_per_decision"] = 2
+    adaptive["expansion"]["max_unobserved_expansions_per_node"] = 1
+    runtime = FileSearchRuntime(tmp_path / ".search")
+    monkeypatch.setattr(runtime, "_kick_evidence_annotator", lambda _run_id: None)
+    frozen = runtime.freeze_spec(
+        SearchSpec.model_validate(data),
+        [project / "evaluator.py"],
+    )
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    high, low_one, low_two = runtime.start_batch(
+        run_id,
+        runtime.plan_next(run_id, requested_k=3).plan_id,
+    )
+    sessions = {
+        task.candidate_id: runtime.start_agent_session(run_id, task.candidate_id)
+        for task in (high, low_one, low_two)
+    }
+
+    high.workspace.joinpath("initial_program.py").write_text(
+        "VALUE = 10\n",
+        encoding="utf-8",
+    )
+    runtime.run_verifier(
+        run_id,
+        high.candidate_id,
+        agent_session_id=sessions[high.candidate_id].agent_session_id,
+        hypothesis="establish the preferred atomic expansion source",
+    )
+
+    for low in (low_one, low_two):
+        low.workspace.joinpath("initial_program.py").write_text(
+            "VALUE = 1\n",
+            encoding="utf-8",
+        )
+        runtime.run_verifier(
+            run_id,
+            low.candidate_id,
+            hypothesis="stage a low lane without worker allocation",
+        )
+
+    runtime.run_verifier(
+        run_id,
+        low_one.candidate_id,
+        hypothesis="make the first low lane batch-eligible",
+    )
+    report = runtime.run_verifier(
+        run_id,
+        low_two.candidate_id,
+        agent_session_id=sessions[low_two.candidate_id].agent_session_id,
+        hypothesis="trigger one atomic allocation for both low lanes",
+    )
+
+    decision = report.allocation_decision
+    assert decision is not None
+    assert [action.kind for action in decision.actions] == [
+        "retire_candidate",
+        "expand_candidate",
+        "retire_candidate",
+        "expand_candidate",
+    ]
+    retired_ids = [
+        action.candidate_id
+        for action in decision.actions
+        if action.kind == "retire_candidate"
+    ]
+    expansions = [
+        action
+        for action in decision.actions
+        if action.kind == "expand_candidate"
+    ]
+    assert retired_ids == [low_two.candidate_id, low_one.candidate_id]
+    assert len({action.source.node_id for action in expansions}) == 2
+    for candidate_id in retired_ids:
+        record = runtime._load_candidate_record(run_id, candidate_id)
+        assert record.allocation_eligibility == "retired"
+        assert record.retired_by_decision_id == decision.decision_id
+
+    monitor = goal_plus_monitor_snapshot(runtime.root_dir, run_id=run_id)
+    allocation_summary = monitor["run"]["allocation_decisions"]
+    assert allocation_summary["reserved_replacements"] == 2
+    assert allocation_summary["max_atomic_replacements"] == 2
+
+    second_expand = expansions[1]
+    assert second_expand.source is not None
+    broken_source = second_expand.source.model_copy(
+        update={"candidate_id": "missing-source"}
+    )
+    broken_actions = [
+        action.model_copy(update={"source": broken_source})
+        if action.action_id == second_expand.action_id
+        else action
+        for action in decision.actions
+    ]
+    runtime._write_allocation_decision(
+        decision.model_copy(update={"actions": broken_actions})
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="allocation source candidate is unavailable",
+    ):
+        runtime.apply_allocation_decision(run_id, decision.decision_id)
+    child_ids = {action.new_candidate_id for action in expansions}
+    assert child_ids.isdisjoint(
+        {record.candidate_id for record in runtime._load_candidate_records(run_id)}
+    )
+
+    runtime._write_allocation_decision(decision)
+    applied = runtime.apply_allocation_decision(run_id, decision.decision_id)
+    assert len(applied["candidate_tasks"]) == 2
+    assert len(applied["agent_sessions"]) == 2
+    assert {item["candidate_id"] for item in applied["candidate_tasks"]} == child_ids
+    repeated = runtime.apply_allocation_decision(run_id, decision.decision_id)
+    assert [item["agent_session_id"] for item in repeated["agent_sessions"]] == [
+        item["agent_session_id"] for item in applied["agent_sessions"]
+    ]
+
+
 def test_allocation_error_does_not_block_annotation_task(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

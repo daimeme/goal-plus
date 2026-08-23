@@ -209,6 +209,9 @@ def test_codex_assets_document_runtime_owned_adaptive_allocation() -> None:
     assert "ValueBackupEvent" in skill
     assert "AllocationStateSnapshot" in skill
     assert "max_unobserved_expansions_per_node" in skill
+    assert "max_replacements_per_decision" in skill
+    assert "所有返回 payload" in skill
+    assert "不能只启动数组第一项" in skill
     assert "expansion_action_context" in skill
     assert "source_path_actions" in skill
     assert "tried_actions" in skill

@@ -161,6 +161,13 @@ slot，也不构成永久分支宽度。完整 `AllocationStateSnapshot` 与 dec
 候选集合、未观测计数、剩余配额和其他资源状态。
 `ValueProjection.unobserved_expansion_count` 只投影已物化但未结算的 child；allocation snapshot
 中的未观测计数还包含已持久化但尚未物化的 expansion decision。
+配置 `allocation.max_replacements_per_decision > 1` 后，一次满足剪枝条件的 settlement 可以把
+其他已经满足同一 policy、但尚未被 allocation fence 的 candidate 一并纳入同一 decision。
+触发 candidate 始终是第一项，其余 candidate 按稳定 id 顺序评估；每选中一项都会先在内存投影中
+扣减总 candidate 容量和 source 未观测配额，再评估下一项。最终 decision 以成对的
+`retire_candidate`/`expand_candidate` actions 一次持久化，因此并发 settlement 在同一 run lock
+下只能看到完整批次及其全部资源占用。内部 reservation keys 不另存第二份事实；资源投影仍从
+actions 重建。默认值为 1，保持单 lane 行为。
 派生 worker 启动或续跑时，runtime 可在 `search_get_agent_context` 中动态生成
 `ExpansionActionContext`。它不新增持久化 action 状态：`SearchGraphProjection.transitions` 提供
 权威边与拓扑，worker `IterationRecord` 提供 hypothesis、`attempt_changed_files` 与 artifact hash，
@@ -186,18 +193,21 @@ Evidence；annotation task 即使在 retirement 后补注册，客观 View 仍�
 Evidence。与普通 iteration 一样，task 尚未注册或 View 生成期间都可暂时显示 `view=null`，调用方
 不轮询。
 `search_apply_allocation_decision` 幂等物化子 workspace、继承父 results ledger 与 run-global
-Evidence 可见性、创建 `AgentSessionRecord`，然后返回 host-native launch payload。runtime 不启动、
-等待或中断 worker；Codex/Pi 主 agent 只执行 decision，host supervisor 不计算 reward、选择来源或
-自动 refill。
+Evidence 可见性、创建 `AgentSessionRecord`，然后返回每个 replacement 的 host-native launch
+payload。apply 在写入任何 candidate 前预检整批 retire/source/child identity、source ledger 和
+总 candidate 容量，避免可判定的后项冲突造成前项半应用；逐 workspace Git/文件操作和宿主 launch
+仍是可恢复的幂等物化，不宣称跨文件系统与宿主进程的分布式 ACID 事务。runtime 不启动、等待或
+中断 worker；Codex/Pi 主 agent 必须从全部 retire actions 对齐 host-owned live handles，并在 slot
+释放后原样启动全部返回 payload。host supervisor 不计算 reward、选择来源或自动 refill。
 
 allocation decision 保存在 `.gp/runs/<run_id>/allocation-decisions/*.json`，不可变 backup event
 保存在 `.gp/runs/<run_id>/value-backups/*.json`，reward 保存在对应 `IterationRecord`，重放后的
 搜索图保存在 `.gp/runs/<run_id>/adaptive-search/search-graph.json`，重放后的值保存在同目录的
 `value-projection.json`。两者都可从 candidate iteration 与 backup event 重建，candidate record
 不保存派生节点缓存，也不存在单独的 action projection 文件。`best.json`、selection 与
-promotion 仍只认硬 verifier score；value layer
-只影响 runtime allocation。当前 engine 已预留 allocation constraint 与 reservation planner 接口，
-但尚未实现原子多候选 reservation、主动最低探索份额、永久节点分支宽度或 frontier width 限制。
+promotion 仍只认硬 verifier score；value layer 只影响 runtime allocation。当前 engine 的
+allocation constraint 与 atomic reservation planner 已消费同一资源投影；主动最低探索份额、
+永久节点分支宽度和 frontier width 限制仍只保留接口，尚未实现。
 
 该模式只适用于可以合法向 worker 暴露硬 metric 的优化任务。隐藏答案 benchmark 不能把
 gold correctness、score、reward 或由它们派生的 allocation decision 暴露给 worker；这类任务

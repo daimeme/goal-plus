@@ -419,22 +419,31 @@ def test_strategy_spec_accepts_parallel_loop_orchestration() -> None:
         StrategySpec(orchestration_mode="adaptive_search")
 
 
-def test_adaptive_expansion_quota_is_optional_and_positive() -> None:
+def test_adaptive_allocation_batch_and_expansion_quota_are_positive() -> None:
     default = AdaptiveSearchSpec()
+    assert default.allocation.max_replacements_per_decision == 1
     assert default.expansion.max_unobserved_expansions_per_node is None
     assert "max_unobserved_expansions_per_node" not in default.expansion.model_dump(
         mode="json"
     )
 
     configured = AdaptiveSearchSpec.model_validate(
-        {"expansion": {"max_unobserved_expansions_per_node": 2}}
+        {
+            "allocation": {"max_replacements_per_decision": 3},
+            "expansion": {"max_unobserved_expansions_per_node": 2},
+        }
     )
+    assert configured.allocation.max_replacements_per_decision == 3
     assert configured.expansion.max_unobserved_expansions_per_node == 2
 
     for invalid in (0, -1):
         with pytest.raises(ValidationError):
             AdaptiveSearchSpec.model_validate(
                 {"expansion": {"max_unobserved_expansions_per_node": invalid}}
+            )
+        with pytest.raises(ValidationError):
+            AdaptiveSearchSpec.model_validate(
+                {"allocation": {"max_replacements_per_decision": invalid}}
             )
 
     legacy_snapshot = AllocationStateSnapshot.model_validate(

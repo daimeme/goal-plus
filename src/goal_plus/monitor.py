@@ -834,6 +834,14 @@ def goal_plus_monitor_snapshot(
                 (run_path / "allocation-decisions").glob("allocation_*.json")
             )
             allocation_decisions = [load_json(path) for path in decision_paths]
+            replacement_counts = [
+                sum(
+                    action.get("kind") == "expand_candidate"
+                    for action in item.get("actions") or []
+                    if isinstance(action, dict)
+                )
+                for item in allocation_decisions
+            ]
             run_payload["allocation_decisions"] = {
                 "total": len(allocation_decisions),
                 "pending": sum(
@@ -844,6 +852,8 @@ def goal_plus_monitor_snapshot(
                     item.get("status") == "applied"
                     for item in allocation_decisions
                 ),
+                "reserved_replacements": sum(replacement_counts),
+                "max_atomic_replacements": max(replacement_counts, default=0),
                 "items": allocation_decisions,
             }
             value_backup_paths = sorted(
