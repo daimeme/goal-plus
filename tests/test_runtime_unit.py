@@ -2143,6 +2143,9 @@ def test_parallel_loops_rejects_second_plan_and_reuses_initial_candidates(
         runtime.plan_next(run_id, requested_k=1)
 
     session = runtime.start_agent_session(run_id, tasks[0].candidate_id)
+    assert "expansion_action_context" not in runtime.get_agent_context(
+        session.agent_session_id
+    )
     report = runtime.run_verifier(
         run_id,
         tasks[0].candidate_id,
@@ -2258,6 +2261,7 @@ def test_get_agent_context_has_only_authoritative_worker_fields(tmp_path: Path) 
         assert forbidden not in context, f"get_agent_context must not return {forbidden}"
     assert context["candidate_task"]["candidate_id"] == tasks[0].candidate_id
     assert context["orchestration_mode"] == "parallel_loops"
+    assert "expansion_action_context" not in context
     assert "history" not in context
     assert "iterations" in context
 

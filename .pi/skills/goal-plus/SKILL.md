@@ -135,7 +135,8 @@ value-guided 组合为
 `reward={name: metric_progress, version: 2}`、
 `value_backup={name: discounted_mean_best, version: 1}`、
 `allocation={name: value_guided_replace, version: 1}` 和
-`expansion={source_policy: highest_value, model_policy: inherit_source, max_depth: ...}`。
+`expansion={source_policy: highest_value, model_policy: inherit_source, max_depth: ...,
+max_unobserved_expansions_per_node: 1}`。
 兼容组合仍可使用 `metric_progress/v1`、`identity/v1` 和 `low_reward_replace/v1`；各组件
 按 name/version 由 runtime 注册并在 freeze 时校验。Pi worker 与 supervisor 的执行协议不按
 组件 name/version 分支，只消费 runtime 返回的持久化 decision。Pi extension 的严格 schema
@@ -147,6 +148,16 @@ runtime 在 verifier 结算后隔离计算 reward，并持久化 retire/expand d
 `ValueProjection.node_values[].backed_up_value` 是 allocation 的派生来源值。runtime 通过不可变
 backup event 沿实际 transition 祖先链重放 mean/best/backed value，并把 lane UCB 与 source
 priority 固定在 decision snapshot 中。
+`max_unobserved_expansions_per_node` 限制同一 source 同时派生但尚未完成首次 verifier 结算的
+candidate 数；pending decision 立即占用，首次结算后释放。它不主动创建 slot，也不限制节点的
+永久分支宽度。
+共享 Evidence 的 adaptive 派生 candidate 会在 `search_get_agent_context` 中按需收到
+`expansion_action_context`。runtime 从 `SearchGraphProjection` 与 settled iteration 动态生成
+`source_path_actions` 和同 source 的 `tried_actions`，用已完成 View 描述实际变化，View 未完成时
+回退到有界 hypothesis。该数据不是新 action 账本或 runtime 技术推荐；相同 source 和 artifact
+hash 的重复尝试保留为独立边并标记重复。`parallel_loops`、初始 adaptive candidate 和
+`global_evidence_mode=independent` 不暴露该字段。配额为 1 时派生会在前一 child 首次结算后再
+继续；未来配额大于 1 时，若要求硬性阻止同时选择相近方向，仍需原子 action reservation。
 Pi worker 和 supervisor 都不计算或改写这些值。
 decision 对外可见前，触发 iteration 的 Git/results ledger 已结算。annotation task 注册与
 reward/allocation 互不作为前置条件，缺失 task 会从已持久化 iteration 幂等补齐。

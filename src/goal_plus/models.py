@@ -526,6 +526,15 @@ class ExpansionPolicySpec(SearchModel):
     source_policy: Literal["highest_value"] = "highest_value"
     model_policy: Literal["inherit_source"] = "inherit_source"
     max_depth: int = Field(default=3, ge=1, le=64)
+    max_unobserved_expansions_per_node: int | None = Field(
+        default=None,
+        gt=0,
+        exclude_if=lambda value: value is None,
+        description=(
+            "每个 source node 同时允许的未观测派生 candidate 上限；"
+            "candidate 首次 verifier 结算后释放。"
+        ),
+    )
     worker_budget: WorkerBudget | None = None
 
 
@@ -1155,6 +1164,43 @@ class ValueProjection(SearchModel):
         return self
 
 
+ActionDescriptionSource = Literal["evidence_view", "hypothesis"]
+
+
+class ObservedActionEdge(SearchModel):
+    """One settled worker attempt projected as an explored search action."""
+
+    schema_version: Literal[1] = 1
+    transition_id: str = Field(min_length=1)
+    candidate_id: str = Field(min_length=1)
+    iteration: int = Field(ge=1)
+    kind: SearchTransitionKind
+    from_node_id: str = Field(min_length=1)
+    settled_node_id: str = Field(min_length=1)
+    attempt_commit: str | None = None
+    description: str = Field(min_length=1, max_length=1000)
+    description_source: ActionDescriptionSource
+    attempt_changed_files: list[str] = Field(default_factory=list)
+    artifact_hash: str | None = None
+    exact_effect_key: str | None = None
+    duplicate_of_transition_id: str | None = None
+    disposition: IterationDisposition
+    score: float | None = Field(default=None, allow_inf_nan=False)
+
+
+class ExpansionActionContext(SearchModel):
+    """Observed path and sibling actions available to one derived candidate."""
+
+    schema_version: Literal[1] = 1
+    graph_revision: int = Field(ge=0)
+    source_node_id: str = Field(min_length=1)
+    source_candidate_id: str = Field(min_length=1)
+    source_path_actions: list[ObservedActionEdge] = Field(default_factory=list)
+    tried_actions: list[ObservedActionEdge] = Field(default_factory=list)
+    unique_tried_action_count: int = Field(ge=0)
+    exact_duplicate_count: int = Field(ge=0)
+
+
 class ExpansionSource(SearchModel):
     node_id: str = Field(min_length=1)
     candidate_id: str = Field(min_length=1)
@@ -1246,6 +1292,19 @@ class AllocationStateSnapshot(SearchModel):
     materialized_candidates: int = Field(ge=0)
     pending_expansions: int = Field(ge=0)
     max_candidates: int = Field(gt=0)
+    max_unobserved_expansions_per_node: int | None = Field(
+        default=None,
+        gt=0,
+        exclude_if=lambda value: value is None,
+    )
+    unobserved_expansions_by_node: dict[str, int] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    exploration_quota_remaining_by_node: dict[str, int] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     source_options: list[AllocationSourceSnapshot] = Field(default_factory=list)
     created_at: str
 

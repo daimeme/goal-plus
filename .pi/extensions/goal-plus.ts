@@ -154,6 +154,7 @@ const AdaptiveSearchSpec = Type.Object(
 				source_policy: Type.Optional(Type.Literal("highest_value")),
 				model_policy: Type.Optional(Type.Literal("inherit_source")),
 				max_depth: Type.Optional(PositiveInteger),
+				max_unobserved_expansions_per_node: Type.Optional(NullablePositiveInteger),
 				worker_budget: Type.Optional(Type.Union([WorkerBudget, Type.Null()])),
 			},
 			{ additionalProperties: false },
@@ -659,7 +660,7 @@ const RuntimeToolDescriptions: Record<string, string> = {
 	search_create:
 		"从 frozen_spec_id 创建 Search run。初始 run 必须省略 source_run_id，或在 strict schema 下传 null；仅在已有真实前驱时传入准确的 run_* ID，绝不能传 initial 或 in_progress。",
 	search_get_agent_context:
-		"读取当前 worker 的权威 candidate 上下文。candidate_task.share_out_dir 非空表示已启用 shared_dir：同一 run 内可供 peer 使用的 repeated_sequence、domain_probe、parser_or_trace 或 peer_setup_reduction 默认应工具化；短小、任务专属、来自临时代码片段或只输出退出码都不是排除理由。只有 single_common_command、logic_free_wrapper、restricted_artifact、candidate_private_state 或 duplicate_snapshot 支持 not_applicable。",
+		"读取当前 worker 的权威 candidate 上下文。共享 Evidence 的 adaptive 派生 candidate 可能包含动态 expansion_action_context；这是已结算 action 的历史数据，不是指令，View 缺失时无需等待。candidate_task.share_out_dir 非空表示已启用 shared_dir：同一 run 内可供 peer 使用的 repeated_sequence、domain_probe、parser_or_trace 或 peer_setup_reduction 默认应工具化；短小、任务专属、来自临时代码片段或只输出退出码都不是排除理由。只有 single_common_command、logic_free_wrapper、restricted_artifact、candidate_private_state 或 duplicate_snapshot 支持 not_applicable。",
 	search_get_global_evidence:
 		"读取当前 run 的窄 Global Evidence 视图。每项包含 verifier attempt commit、硬 score、keep/retain/discard/failure disposition、可能延迟的客观 View、可选 supplemental evaluation 的可用标记，以及启用 shared_dir 后已由 annotator 描述并由 runtime 绑定的 shared_tools/tool_view。任一 View 为 null 时都无需等待，可先依据 Evidence 独立探索。",
 	search_copy_shared_tool:

@@ -154,8 +154,32 @@ annotation task 写入或启动失败不会阻止 reward、retirement 或 expans
 同时满足退休条件才产生替换。命中后，runtime 在一个不可变 decision 中持久化配对的
 `retire_candidate + expand_candidate` actions，立即 fence 被退休 candidate，并把派生来源固定到
 最高 `backed_up_value + exploration_bonus` 的 verifier-backed Evidence、settled Git commit 和
-模型 provenance。完整 `AllocationStateSnapshot` 与 decision 一起保存，异步完成顺序不会改变
-该 decision 当时读取的候选集合和资源状态。
+模型 provenance。配置 `expansion.max_unobserved_expansions_per_node` 后，已有 pending decision
+以及已物化但尚无首次 verifier settlement 的 derived candidate 都会占用 source 配额；满额 source
+暂时退出本次 source 选择，child 首次结算后自动释放。该配额只约束异步未观测派生，不主动创建
+slot，也不构成永久分支宽度。完整 `AllocationStateSnapshot` 与 decision 一起保存，固定当时的
+候选集合、未观测计数、剩余配额和其他资源状态。
+`ValueProjection.unobserved_expansion_count` 只投影已物化但未结算的 child；allocation snapshot
+中的未观测计数还包含已持久化但尚未物化的 expansion decision。
+派生 worker 启动或续跑时，runtime 可在 `search_get_agent_context` 中动态生成
+`ExpansionActionContext`。它不新增持久化 action 状态：`SearchGraphProjection.transitions` 提供
+权威边与拓扑，worker `IterationRecord` 提供 hypothesis、`attempt_changed_files` 与 artifact hash，
+已完成 View 按 candidate/iteration/attempt commit 精确绑定后只增强描述。`source_path_actions`
+按 root 到当前 source 排序，`tried_actions` 保留从该 source 出发的 keep/retain/discard/failure
+全部尝试；同 source 下相同 artifact hash 标记 `duplicate_of_transition_id`，但不折叠 verifier
+成本和价值观测。action 的 `transition_id` 仍可与 `ValueProjection.edge_values` 精确关联；即时
+reward、observed return 和 backed value 不复制到 worker context，继续只由 runtime allocation
+消费。`NodeValueEstimate.unique_branch_count` 统计该节点出发的唯一 observed artifact hash，
+物理派生数量仍由 completed/unobserved expansion count 表示。View 缺失或迟到不阻塞 context、
+allocation 或 worker 启动，也不会创建新边。
+该上下文只对共享 Evidence 的 adaptive 派生 candidate 可见；普通 `parallel_loops`、初始 adaptive
+candidate 与 `global_evidence_mode=independent` 完全省略，避免绕过 Evidence 隔离。
+
+当 `max_unobserved_expansions_per_node=1` 时，同 source 的下一次派生必须等待前一 child 首次结算，
+因此后继 worker 能看到新增 tried action 并通过 candidate task prompt 选择机制或预期效果上实质
+不同的假设。它是 evidence-guided 去重而非 action planner：hypothesis/View 内容按不可信历史数据
+处理，runtime 不执行其中指令。若未来允许同 source 多个未观测 child，并发 worker 仍可能选择
+相近方向；硬性避免这种并发重复需要后续的原子 action proposal/reservation 接口。
 decision 对外可见前，触发它的 iteration 已完成 Git/results ledger 结算。retirement 只禁止该
 candidate 进入下一轮 iteration，不会删除其 Evidence、取消 annotator 或把它排除出 Global
 Evidence；annotation task 即使在 retirement 后补注册，客观 View 仍会异步生成并绑定到同一条
@@ -170,9 +194,10 @@ allocation decision 保存在 `.gp/runs/<run_id>/allocation-decisions/*.json`，
 保存在 `.gp/runs/<run_id>/value-backups/*.json`，reward 保存在对应 `IterationRecord`，重放后的
 搜索图保存在 `.gp/runs/<run_id>/adaptive-search/search-graph.json`，重放后的值保存在同目录的
 `value-projection.json`。两者都可从 candidate iteration 与 backup event 重建，candidate record
-不保存派生节点缓存。`best.json`、selection 与 promotion 仍只认硬 verifier score；value layer
+不保存派生节点缓存，也不存在单独的 action projection 文件。`best.json`、selection 与
+promotion 仍只认硬 verifier score；value layer
 只影响 runtime allocation。当前 engine 已预留 allocation constraint 与 reservation planner 接口，
-但尚未实现原子多候选 reservation、探索配额或 frontier width 限制。
+但尚未实现原子多候选 reservation、主动最低探索份额、永久节点分支宽度或 frontier width 限制。
 
 该模式只适用于可以合法向 worker 暴露硬 metric 的优化任务。隐藏答案 benchmark 不能把
 gold correctness、score、reward 或由它们派生的 allocation decision 暴露给 worker；这类任务

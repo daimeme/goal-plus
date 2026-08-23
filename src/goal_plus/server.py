@@ -237,8 +237,9 @@ def create_mcp(
         """Subagent 的首次调用，返回权威 id 和工作区。
 
         返回 run_id、candidate_id、workspace、candidate_task 和 subagent 自己的
-        iterations/results。由 subagent 调用，不由主 agent 调用。subagent 必须把
-        prompt 提供的 id 只当作标签，并将此响应作为事实来源。
+        iterations/results。共享 Evidence 的 adaptive 派生 candidate 还可能包含从已结算
+        transition 动态投影的 expansion_action_context。由 subagent 调用，不由主
+        agent 调用。subagent 必须把 prompt 提供的 id 只当作标签，并将此响应作为事实来源。
         """
         return tools.search_get_agent_context(agent_session_id)
 

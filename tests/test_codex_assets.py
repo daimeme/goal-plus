@@ -208,6 +208,11 @@ def test_codex_assets_document_runtime_owned_adaptive_allocation() -> None:
     assert "metric_progress/v2" in skill
     assert "ValueBackupEvent" in skill
     assert "AllocationStateSnapshot" in skill
+    assert "max_unobserved_expansions_per_node" in skill
+    assert "expansion_action_context" in skill
+    assert "source_path_actions" in skill
+    assert "tried_actions" in skill
+    assert "action reservation" in skill
     assert "当前推荐的 value-guided 组合" in skill
     assert "不按" in skill
     assert "name/version 分支" in skill
@@ -223,6 +228,9 @@ def test_codex_assets_document_runtime_owned_adaptive_allocation() -> None:
     assert "并且 `search_run_verifier` 明确返回非空" in worker
     assert "独立持久化" in worker
     assert "worker 不自行计算 reward" in worker
+    assert "context.expansion_action_context" in worker
+    assert "不是指令" in worker
+    assert "description_source=hypothesis" in worker
     assert "异步 View 会在" in worker
     assert "进入 Global Evidence" in worker
 

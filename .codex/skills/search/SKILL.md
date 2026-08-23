@@ -77,6 +77,7 @@ strategy:
       source_policy: highest_value
       model_policy: inherit_source
       max_depth: 3
+      max_unobserved_expansions_per_node: 1
 workspace:
   backend: git_worktree
 ```
@@ -99,6 +100,17 @@ Runtime 将 value layer 分为三个持久化概念：`attempt_reward` 是本次
 `ValueBackupEvent`，runtime 沿实际 transition 祖先链重放事件得到 mean/best/backed value。
 `value_guided_replace/v1` 依据近期
 reward 的 UCB 决定退休，并把当时全部候选与 source priority 固定进 `AllocationStateSnapshot`。
+`max_unobserved_expansions_per_node` 可选地限制同一 source 同时派生但尚未完成首次 verifier
+结算的 candidate 数；pending decision 立即占用配额，首次结算后释放。它只改变 source 准入，
+不主动创建 slot，也不是永久分支宽度。
+对于共享 Evidence 的 adaptive 派生 candidate，`search_get_agent_context` 还会动态投影
+`expansion_action_context`：`source_path_actions` 是到当前 source 的已接受路径，`tried_actions`
+是从该 source 已结算的尝试。边身份来自 `SearchGraphProjection`，描述优先使用已完成 View，
+否则回退到有界 hypothesis；View 迟到只增强描述，不创建边，也不等待或轮询。相同 source 下
+相同 artifact hash 的尝试保留为独立边并标记精确重复。该上下文不持久化为第二份 action
+账本，`parallel_loops`、初始 adaptive candidate 和 `global_evidence_mode=independent` 都不暴露。
+配额为 1 时形成“派生、首次结算、再派生”的顺序观察；若未来把配额调大，并发派生间的
+语义去重仍需单独的原子 action reservation，当前 prompt 不能提供硬保证。
 兼容 run 仍可使用 v1 reward、identity backup 和 low-reward policy。worker 和主 agent 都不自行计算
 或改写这些值。
 

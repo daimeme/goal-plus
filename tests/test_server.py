@@ -181,6 +181,18 @@ def test_freeze_spec_exposes_complete_nested_search_spec_schema(tmp_path: Path) 
     strategy = spec_schema["properties"]["strategy"]
     assert "worker_budget" in strategy["properties"]
     assert "evidence_annotator" in strategy["properties"]
+    adaptive = next(
+        item
+        for item in strategy["properties"]["adaptive_search"]["anyOf"]
+        if item.get("type") == "object"
+    )
+    expansion = adaptive["properties"]["expansion"]["properties"]
+    quota = next(
+        item
+        for item in expansion["max_unobserved_expansions_per_node"]["anyOf"]
+        if item.get("type") == "integer"
+    )
+    assert quota["exclusiveMinimum"] == 0
 
     budget = spec_schema["properties"]["budget"]["properties"]
     assert "初始创建并实际并行工作" in budget["max_parallel"]["description"]

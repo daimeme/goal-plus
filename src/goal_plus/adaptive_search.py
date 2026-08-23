@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -10,13 +11,16 @@ from pydantic import Field
 
 from goal_plus.models import (
     AdaptiveSearchSpec,
+    AllocationDecision,
     AllocationSourceSnapshot,
     AllocationStateSnapshot,
     CandidateRecord,
     EdgeValueEstimate,
+    ExpansionActionContext,
     ExpansionSource,
     IterationRecord,
     NodeValueEstimate,
+    ObservedActionEdge,
     RewardEvaluation,
     SearchGraphProjection,
     SearchModel,
@@ -468,6 +472,7 @@ class LowRewardReplacePolicy:
             context.graph,
             context.values,
             context.records,
+            context.resources,
             max_depth=context.adaptive_spec.expansion.max_depth,
         )
         if source is None:
@@ -538,9 +543,13 @@ class ValueGuidedReplacePolicy:
             context.graph,
             context.values,
             context.records,
+            context.resources,
             max_depth=context.adaptive_spec.expansion.max_depth,
             exploration_weight=config.source_exploration_weight,
             include_retired=True,
+        )
+        quota = (
+            context.adaptive_spec.expansion.max_unobserved_expansions_per_node
         )
         snapshot = AllocationStateSnapshot(
             trigger_candidate_id=record.candidate_id,
@@ -556,6 +565,17 @@ class ValueGuidedReplacePolicy:
             materialized_candidates=context.resources.materialized_candidates,
             pending_expansions=context.resources.pending_expansions,
             max_candidates=context.resources.max_candidates,
+            max_unobserved_expansions_per_node=quota,
+            unobserved_expansions_by_node=(
+                dict(context.resources.unobserved_expansions_by_node)
+                if quota is not None
+                else None
+            ),
+            exploration_quota_remaining_by_node=(
+                dict(context.resources.exploration_quota_remaining_by_node)
+                if quota is not None
+                else None
+            ),
             source_options=[item.snapshot for item in source_options],
             created_at=record.iterations[-1].created_at,
         )
@@ -851,7 +871,11 @@ _VALUE_BACKUP_OPERATORS: dict[tuple[str, int], ValueBackupOperator] = {
 }
 
 
-def adaptive_component_hash(name: str, version: int, params: dict[str, object]) -> str:
+def adaptive_component_hash(
+    name: str,
+    version: int,
+    params: dict[str, object],
+) -> str:
     payload = json.dumps(
         {"name": name, "version": version, "params": params},
         ensure_ascii=True,
@@ -909,6 +933,65 @@ def decide_allocation(
 def allocation_config_hash(spec: AdaptiveSearchSpec) -> str:
     config = spec.allocation
     return adaptive_component_hash(config.name, config.version, config.params)
+
+
+def project_allocation_resources(
+    adaptive_spec: AdaptiveSearchSpec,
+    graph: SearchGraphProjection,
+    records: list[CandidateRecord],
+    decisions: list[AllocationDecision],
+    *,
+    max_candidates: int,
+) -> AllocationResourceState:
+    """Derive allocation capacity from durable candidate and decision facts."""
+
+    materialized_ids = {record.candidate_id for record in records}
+    unobserved_ids_by_node: dict[str, set[str]] = {}
+
+    for record in records:
+        source = record.task.expansion_source
+        if source is not None and not record.iterations:
+            unobserved_ids_by_node.setdefault(source.node_id, set()).add(
+                record.candidate_id
+            )
+
+    unmaterialized_expansion_ids: set[str] = set()
+    for decision in decisions:
+        for action in decision.actions:
+            if action.kind != "expand_candidate":
+                continue
+            assert action.source is not None
+            assert action.new_candidate_id is not None
+            child_id = action.new_candidate_id
+            if child_id not in materialized_ids:
+                unmaterialized_expansion_ids.add(child_id)
+                unobserved_ids_by_node.setdefault(
+                    action.source.node_id,
+                    set(),
+                ).add(child_id)
+
+    unobserved_expansions = {
+        node_id: len(candidate_ids)
+        for node_id, candidate_ids in unobserved_ids_by_node.items()
+    }
+    quota = adaptive_spec.expansion.max_unobserved_expansions_per_node
+    quota_remaining: dict[str, int] = {}
+    if quota is not None:
+        quota_remaining = {
+            node.node_id: max(
+                0,
+                quota - unobserved_expansions.get(node.node_id, 0),
+            )
+            for node in graph.nodes
+            if node.kind == "settled_iteration"
+        }
+    return AllocationResourceState(
+        materialized_candidates=len(records),
+        pending_expansions=len(unmaterialized_expansion_ids),
+        max_candidates=max_candidates,
+        unobserved_expansions_by_node=unobserved_expansions,
+        exploration_quota_remaining_by_node=quota_remaining,
+    )
 
 
 def value_backup_config_hash(spec: AdaptiveSearchSpec) -> str:
@@ -1107,6 +1190,122 @@ def project_search_graph(
     )
 
 
+def project_expansion_action_context(
+    graph: SearchGraphProjection,
+    records: list[CandidateRecord],
+    source_node_id: str,
+    *,
+    view_descriptions: Mapping[tuple[str, int, str], str] | None = None,
+) -> ExpansionActionContext | None:
+    """Join settled search facts into a derived worker's observed actions."""
+
+    nodes_by_id = {node.node_id: node for node in graph.nodes}
+    source_node = nodes_by_id.get(source_node_id)
+    if source_node is None or source_node.kind != "settled_iteration":
+        return None
+
+    iterations = {
+        (record.candidate_id, iteration.iteration): iteration
+        for record in records
+        for iteration in record.iterations
+        if iteration.agent_session_id is not None
+    }
+    descriptions = view_descriptions or {}
+    ordered_transitions = sorted(
+        graph.transitions,
+        key=lambda item: (
+            item.created_at,
+            item.candidate_id,
+            item.iteration,
+            item.transition_id,
+        ),
+    )
+    first_transition_by_effect: dict[str, str] = {}
+    actions_by_transition: dict[str, ObservedActionEdge] = {}
+    ordered_actions: list[ObservedActionEdge] = []
+    for transition in ordered_transitions:
+        iteration = iterations.get((transition.candidate_id, transition.iteration))
+        if iteration is None:
+            continue
+        effect_key = (
+            _stable_id("action-effect", transition.from_node_id, iteration.artifact_hash)
+            if iteration.artifact_hash is not None
+            else None
+        )
+        duplicate_of = None
+        if effect_key is not None:
+            duplicate_of = first_transition_by_effect.setdefault(
+                effect_key,
+                transition.transition_id,
+            )
+            if duplicate_of == transition.transition_id:
+                duplicate_of = None
+
+        view_key = (
+            (transition.candidate_id, transition.iteration, transition.attempt_commit)
+            if transition.attempt_commit is not None
+            else None
+        )
+        view_description = descriptions.get(view_key) if view_key is not None else None
+        description = view_description or iteration.hypothesis or iteration.summary
+        description = " ".join(description.strip().split())[:1000]
+        if not description:
+            description = "Observed settled worker attempt."
+        action = ObservedActionEdge(
+            transition_id=transition.transition_id,
+            candidate_id=transition.candidate_id,
+            iteration=transition.iteration,
+            kind=transition.kind,
+            from_node_id=transition.from_node_id,
+            settled_node_id=transition.settled_node_id,
+            attempt_commit=transition.attempt_commit,
+            description=description,
+            description_source=(
+                "evidence_view" if view_description is not None else "hypothesis"
+            ),
+            attempt_changed_files=iteration.attempt_changed_files,
+            artifact_hash=iteration.artifact_hash,
+            exact_effect_key=effect_key,
+            duplicate_of_transition_id=duplicate_of,
+            disposition=transition.disposition,
+            score=transition.score,
+        )
+        actions_by_transition[transition.transition_id] = action
+        ordered_actions.append(action)
+
+    source_path_actions: list[ObservedActionEdge] = []
+    cursor = source_node
+    while cursor.incoming_transition_id is not None:
+        action = actions_by_transition.get(cursor.incoming_transition_id)
+        if action is not None:
+            source_path_actions.append(action)
+        if cursor.parent_node_id is None:
+            break
+        parent = nodes_by_id.get(cursor.parent_node_id)
+        if parent is None:
+            break
+        cursor = parent
+    source_path_actions.reverse()
+
+    tried_actions = [
+        action for action in ordered_actions if action.from_node_id == source_node_id
+    ]
+    unique_effects = {
+        action.exact_effect_key or action.transition_id for action in tried_actions
+    }
+    return ExpansionActionContext(
+        graph_revision=graph.revision,
+        source_node_id=source_node_id,
+        source_candidate_id=source_node.candidate_id,
+        source_path_actions=source_path_actions,
+        tried_actions=tried_actions,
+        unique_tried_action_count=len(unique_effects),
+        exact_duplicate_count=sum(
+            action.duplicate_of_transition_id is not None for action in tried_actions
+        ),
+    )
+
+
 def _reward_evaluator(name: str, version: int) -> RewardEvaluator:
     try:
         return _REWARD_EVALUATORS[(name, version)]
@@ -1151,6 +1350,11 @@ def _initial_value_projection(
     direct_attempts: dict[str, int] = {}
     unique_branches: dict[str, set[str]] = {}
     total_costs: dict[str, float] = {}
+    iterations_by_coordinate = {
+        (record.candidate_id, iteration.iteration): iteration
+        for record in records
+        for iteration in record.iterations
+    }
     iteration_costs = {
         (record.candidate_id, iteration.iteration): float(
             (iteration.reward_evaluation.components or {}).get(
@@ -1166,9 +1370,12 @@ def _initial_value_projection(
         direct_attempts[transition.from_node_id] = (
             direct_attempts.get(transition.from_node_id, 0) + 1
         )
-        if transition.accepted_node_id is not None:
+        iteration = iterations_by_coordinate.get(
+            (transition.candidate_id, transition.iteration)
+        )
+        if iteration is not None and iteration.artifact_hash is not None:
             unique_branches.setdefault(transition.from_node_id, set()).add(
-                transition.accepted_node_id
+                iteration.artifact_hash
             )
         total_costs[transition.from_node_id] = (
             total_costs.get(transition.from_node_id, 0.0)
@@ -1184,9 +1391,6 @@ def _initial_value_projection(
         source = record.task.expansion_source
         if source is None:
             continue
-        unique_branches.setdefault(source.node_id, set()).add(
-            f"candidate:{record.candidate_id}"
-        )
         target = completed_expansions if record.iterations else unobserved_expansions
         target[source.node_id] = target.get(source.node_id, 0) + 1
 
@@ -1231,6 +1435,7 @@ def _source_options(
     graph: SearchGraphProjection,
     values: ValueProjection,
     records: list[CandidateRecord],
+    resources: AllocationResourceState,
     *,
     max_depth: int,
     exploration_weight: float,
@@ -1268,6 +1473,11 @@ def _source_options(
             ineligible_reason = "max_depth"
         elif not include_retired and record.allocation_eligibility != "eligible":
             ineligible_reason = "retired"
+        elif (
+            resources.exploration_quota_remaining_by_node.get(node.node_id)
+            == 0
+        ):
+            ineligible_reason = "exploration_quota_exhausted"
         visits = expansion_visits.get(node.node_id, 0)
         exploration_bonus = exploration_weight * math.sqrt(
             math.log(total_expansions + 2.0) / (visits + 1.0)
@@ -1314,6 +1524,7 @@ def _highest_value_source(
     graph: SearchGraphProjection,
     values: ValueProjection,
     records: list[CandidateRecord],
+    resources: AllocationResourceState,
     *,
     max_depth: int,
 ) -> ExpansionSource | None:
@@ -1321,6 +1532,7 @@ def _highest_value_source(
         graph,
         values,
         records,
+        resources,
         max_depth=max_depth,
         exploration_weight=0.0,
         include_retired=False,
@@ -1379,6 +1591,38 @@ class AdaptiveSearchEngine:
         created_at: str,
     ) -> SearchGraphProjection:
         return project_search_graph(run_id, records, created_at=created_at)
+
+    def project_action_context(
+        self,
+        graph: SearchGraphProjection,
+        records: list[CandidateRecord],
+        source_node_id: str,
+        *,
+        view_descriptions: Mapping[tuple[str, int, str], str] | None = None,
+    ) -> ExpansionActionContext | None:
+        return project_expansion_action_context(
+            graph,
+            records,
+            source_node_id,
+            view_descriptions=view_descriptions,
+        )
+
+    def project_resources(
+        self,
+        adaptive_spec: AdaptiveSearchSpec,
+        graph: SearchGraphProjection,
+        records: list[CandidateRecord],
+        decisions: list[AllocationDecision],
+        *,
+        max_candidates: int,
+    ) -> AllocationResourceState:
+        return project_allocation_resources(
+            adaptive_spec,
+            graph,
+            records,
+            decisions,
+            max_candidates=max_candidates,
+        )
 
     def settle_values(
         self,

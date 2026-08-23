@@ -6,8 +6,10 @@ import pytest
 from pydantic import ValidationError
 
 from goal_plus.models import (
+    AdaptiveSearchSpec,
     AgentHostHandle,
     AgentSessionRecord,
+    AllocationStateSnapshot,
     Budget,
     CandidateRecord,
     CandidateProposal,
@@ -415,6 +417,48 @@ def test_strategy_spec_accepts_parallel_loop_orchestration() -> None:
         match="strategy.adaptive_search is required for adaptive_search mode",
     ):
         StrategySpec(orchestration_mode="adaptive_search")
+
+
+def test_adaptive_expansion_quota_is_optional_and_positive() -> None:
+    default = AdaptiveSearchSpec()
+    assert default.expansion.max_unobserved_expansions_per_node is None
+    assert "max_unobserved_expansions_per_node" not in default.expansion.model_dump(
+        mode="json"
+    )
+
+    configured = AdaptiveSearchSpec.model_validate(
+        {"expansion": {"max_unobserved_expansions_per_node": 2}}
+    )
+    assert configured.expansion.max_unobserved_expansions_per_node == 2
+
+    for invalid in (0, -1):
+        with pytest.raises(ValidationError):
+            AdaptiveSearchSpec.model_validate(
+                {"expansion": {"max_unobserved_expansions_per_node": invalid}}
+            )
+
+    legacy_snapshot = AllocationStateSnapshot.model_validate(
+        {
+            "trigger_candidate_id": "c001",
+            "trigger_iteration": 2,
+            "evaluated_attempts": 2,
+            "total_evaluated_attempts": 4,
+            "recent_attempt_rewards": [0.0, 0.0],
+            "recent_mean_reward": 0.0,
+            "recent_standard_error": 0.0,
+            "lane_exploration_bonus": 0.0,
+            "lane_upper_confidence_bound": 0.0,
+            "nonpositive_fraction": 1.0,
+            "materialized_candidates": 2,
+            "pending_expansions": 0,
+            "max_candidates": 4,
+            "created_at": "2026-08-22T00:00:00Z",
+        }
+    )
+    dumped_snapshot = legacy_snapshot.model_dump(mode="json")
+    assert "max_unobserved_expansions_per_node" not in dumped_snapshot
+    assert "unobserved_expansions_by_node" not in dumped_snapshot
+    assert "exploration_quota_remaining_by_node" not in dumped_snapshot
 
 
 def test_strategy_spec_accepts_worker_budget() -> None:

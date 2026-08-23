@@ -34,7 +34,12 @@ class _StaticAnnotator:
         )
 
 
-def adaptive_spec(project: Path, *, max_candidates: int = 4) -> SearchSpec:
+def adaptive_spec(
+    project: Path,
+    *,
+    max_candidates: int = 4,
+    max_parallel: int = 2,
+) -> SearchSpec:
     project.joinpath("evaluator.py").write_text(
         "import json\n"
         "namespace = {}\n"
@@ -42,9 +47,9 @@ def adaptive_spec(project: Path, *, max_candidates: int = 4) -> SearchSpec:
         "print(json.dumps({'combined_score': namespace['VALUE']}))\n",
         encoding="utf-8",
     )
-    data = spec_for(project, max_parallel=2).model_dump(mode="json")
+    data = spec_for(project, max_parallel=max_parallel).model_dump(mode="json")
     data["budget"] = {
-        "max_parallel": 2,
+        "max_parallel": max_parallel,
         "max_candidates": max_candidates,
     }
     data["workspace"] = {"backend": "git_worktree"}
@@ -76,10 +81,16 @@ def adaptive_spec(project: Path, *, max_candidates: int = 4) -> SearchSpec:
     return SearchSpec.model_validate(data)
 
 
-def adaptive_v2_spec(project: Path, *, max_candidates: int = 4) -> SearchSpec:
+def adaptive_v2_spec(
+    project: Path,
+    *,
+    max_candidates: int = 4,
+    max_parallel: int = 2,
+) -> SearchSpec:
     data = adaptive_spec(
         project,
         max_candidates=max_candidates,
+        max_parallel=max_parallel,
     ).model_dump(mode="json")
     data["strategy"]["adaptive_search"] = {
         "reward": {
@@ -282,10 +293,14 @@ def test_adaptive_reward_prunes_and_derives_exact_incumbent(
         task.candidate_id: runtime.start_agent_session(run_id, task.candidate_id)
         for task in tasks
     }
-    assert {
-        runtime.get_agent_context(session.agent_session_id)["orchestration_mode"]
+    initial_contexts = [
+        runtime.get_agent_context(session.agent_session_id)
         for session in sessions.values()
-    } == {"adaptive_search"}
+    ]
+    assert {context["orchestration_mode"] for context in initial_contexts} == {
+        "adaptive_search"
+    }
+    assert all("expansion_action_context" not in context for context in initial_contexts)
 
     high = tasks[0]
     low = tasks[1]
@@ -439,14 +454,32 @@ def test_adaptive_reward_prunes_and_derives_exact_incumbent(
         encoding="utf-8"
     ) == "VALUE = 11\n"
 
+    child_context = runtime.get_agent_context(child_session["agent_session_id"])
+    action_context = child_context["expansion_action_context"]
+    assert action_context["source_node_id"] == expand.source.node_id
+    assert [
+        action["iteration"] for action in action_context["source_path_actions"]
+    ] == [1, 2]
+    assert [
+        action["description_source"]
+        for action in action_context["source_path_actions"]
+    ] == ["evidence_view", "evidence_view"]
+    assert [
+        (action["candidate_id"], action["iteration"])
+        for action in action_context["tried_actions"]
+    ] == [(high.candidate_id, 3)]
+    assert action_context["tried_actions"][0]["description"] == (
+        f"Settled {high.candidate_id} iteration 3."
+    )
+
     child_workspace.joinpath("initial_program.py").write_text(
-        "VALUE = 5\n", encoding="utf-8"
+        "VALUE = 9\n", encoding="utf-8"
     )
     child_report = runtime.run_verifier(
         run_id,
         child_task["candidate_id"],
         agent_session_id=child_session["agent_session_id"],
-        hypothesis="test a derived change that regresses",
+        hypothesis="repeat the settled regression from the same source",
     )
     assert child_report.disposition == "discard"
     assert child_report.reward_evaluation is not None
@@ -455,6 +488,52 @@ def test_adaptive_reward_prunes_and_derives_exact_incumbent(
     assert child_workspace.joinpath("initial_program.py").read_text(
         encoding="utf-8"
     ) == "VALUE = 11\n"
+
+    pending_action_context = runtime.get_agent_context(
+        child_session["agent_session_id"]
+    )["expansion_action_context"]
+    first_action, duplicate_action = pending_action_context["tried_actions"]
+    assert first_action["exact_effect_key"] == duplicate_action["exact_effect_key"]
+    assert duplicate_action["duplicate_of_transition_id"] == first_action[
+        "transition_id"
+    ]
+    assert duplicate_action["description_source"] == "hypothesis"
+    assert duplicate_action["description"] == (
+        "repeat the settled regression from the same source"
+    )
+    assert duplicate_action["attempt_changed_files"] == ["initial_program.py"]
+    assert pending_action_context["unique_tried_action_count"] == 1
+    assert pending_action_context["exact_duplicate_count"] == 1
+
+    assert drain_evidence_annotations(
+        runtime.root_dir,
+        run_id,
+        annotator=_StaticAnnotator(),
+    ) == 1
+    enriched_action_context = runtime.get_agent_context(
+        child_session["agent_session_id"]
+    )["expansion_action_context"]
+    enriched_duplicate = enriched_action_context["tried_actions"][1]
+    assert enriched_duplicate["transition_id"] == duplicate_action["transition_id"]
+    assert enriched_duplicate["exact_effect_key"] == duplicate_action[
+        "exact_effect_key"
+    ]
+    assert enriched_duplicate["duplicate_of_transition_id"] == duplicate_action[
+        "duplicate_of_transition_id"
+    ]
+    assert enriched_duplicate["description_source"] == "evidence_view"
+    assert enriched_duplicate["description"] == (
+        f"Settled {child_task['candidate_id']} iteration 1."
+    )
+
+    child_values = runtime._load_value_projection(run_id)
+    assert child_values is not None
+    child_source_value = next(
+        item
+        for item in child_values.node_values
+        if item.node_id == expand.source.node_id
+    )
+    assert child_source_value.unique_branch_count == 1
 
     evidence = runtime.get_global_evidence(child_session["agent_session_id"])
     assert {item["candidate_id"] for item in evidence} == {
@@ -632,6 +711,220 @@ def test_value_guided_allocation_backs_child_return_into_source_node(
         expand.source.node_id,
         source_graph_node.parent_node_id,
     ]
+
+
+def test_independent_evidence_omits_derived_action_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    runtime = FileSearchRuntime(tmp_path / ".search")
+    monkeypatch.setattr(runtime, "_kick_evidence_annotator", lambda _run_id: None)
+    data = adaptive_spec(project, max_candidates=3).model_dump(mode="json")
+    data["strategy"]["config"] = {"global_evidence_mode": "independent"}
+    frozen = runtime.freeze_spec(
+        SearchSpec.model_validate(data),
+        [project / "evaluator.py"],
+    )
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    high, low = runtime.start_batch(
+        run_id,
+        runtime.plan_next(run_id, requested_k=2).plan_id,
+    )
+    high_session = runtime.start_agent_session(run_id, high.candidate_id)
+    low_session = runtime.start_agent_session(run_id, low.candidate_id)
+
+    high.workspace.joinpath("initial_program.py").write_text(
+        "VALUE = 10\n", encoding="utf-8"
+    )
+    runtime.run_verifier(
+        run_id,
+        high.candidate_id,
+        agent_session_id=high_session.agent_session_id,
+        hypothesis="establish the independent expansion source",
+    )
+    low.workspace.joinpath("initial_program.py").write_text(
+        "VALUE = 1\n", encoding="utf-8"
+    )
+    runtime.run_verifier(
+        run_id,
+        low.candidate_id,
+        agent_session_id=low_session.agent_session_id,
+        hypothesis="establish the independent low lane",
+    )
+    report = runtime.run_verifier(
+        run_id,
+        low.candidate_id,
+        agent_session_id=low_session.agent_session_id,
+        hypothesis="confirm the independent low lane has no progress",
+    )
+    assert report.allocation_decision is not None
+    applied = runtime.apply_allocation_decision(
+        run_id,
+        report.allocation_decision.decision_id,
+    )
+    child_session_id = applied["agent_sessions"][0]["agent_session_id"]
+
+    def unexpected_projection(*args: object, **kwargs: object) -> object:
+        raise AssertionError("independent mode must not project peer actions")
+
+    monkeypatch.setattr(
+        runtime._adaptive_search,
+        "project_action_context",
+        unexpected_projection,
+    )
+    assert "expansion_action_context" not in runtime.get_agent_context(
+        child_session_id
+    )
+
+
+def test_exploration_quota_reserves_pending_source_until_child_is_observed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GOAL_PLUS_SUPPLEMENTAL_EVALUATION_ENABLED", "0")
+    project = make_project(tmp_path)
+    data = adaptive_v2_spec(
+        project,
+        max_candidates=6,
+        max_parallel=3,
+    ).model_dump(mode="json")
+    data["strategy"]["adaptive_search"]["expansion"][
+        "max_unobserved_expansions_per_node"
+    ] = 1
+    runtime = FileSearchRuntime(tmp_path / ".search")
+    monkeypatch.setattr(runtime, "_kick_evidence_annotator", lambda _run_id: None)
+    frozen = runtime.freeze_spec(
+        SearchSpec.model_validate(data),
+        [project / "evaluator.py"],
+    )
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    high, low_one, low_two = runtime.start_batch(
+        run_id,
+        runtime.plan_next(run_id, requested_k=3).plan_id,
+    )
+    sessions = {
+        task.candidate_id: runtime.start_agent_session(
+            run_id,
+            task.candidate_id,
+        )
+        for task in (high, low_one, low_two)
+    }
+
+    high.workspace.joinpath("initial_program.py").write_text(
+        "VALUE = 10\n",
+        encoding="utf-8",
+    )
+    runtime.run_verifier(
+        run_id,
+        high.candidate_id,
+        agent_session_id=sessions[high.candidate_id].agent_session_id,
+        hypothesis="establish the preferred expansion source",
+    )
+
+    decisions = []
+    for low in (low_one, low_two):
+        low.workspace.joinpath("initial_program.py").write_text(
+            "VALUE = 1\n",
+            encoding="utf-8",
+        )
+        runtime.run_verifier(
+            run_id,
+            low.candidate_id,
+            agent_session_id=sessions[low.candidate_id].agent_session_id,
+            hypothesis="establish a low-value lane",
+        )
+        report = runtime.run_verifier(
+            run_id,
+            low.candidate_id,
+            agent_session_id=sessions[low.candidate_id].agent_session_id,
+            hypothesis="confirm a low-value lane has no marginal return",
+        )
+        assert report.allocation_decision is not None
+        decisions.append(report.allocation_decision)
+
+    first_expand = next(
+        action
+        for action in decisions[0].actions
+        if action.kind == "expand_candidate"
+    )
+    second_expand = next(
+        action
+        for action in decisions[1].actions
+        if action.kind == "expand_candidate"
+    )
+    assert first_expand.source is not None
+    assert second_expand.source is not None
+    preferred_node_id = first_expand.source.node_id
+    assert first_expand.source.candidate_id == high.candidate_id
+    assert second_expand.source.node_id != preferred_node_id
+
+    second_snapshot = decisions[1].state_snapshot
+    assert second_snapshot is not None
+    assert second_snapshot.max_unobserved_expansions_per_node == 1
+    assert second_snapshot.unobserved_expansions_by_node == {
+        preferred_node_id: 1
+    }
+    assert second_snapshot.exploration_quota_remaining_by_node[
+        preferred_node_id
+    ] == 0
+    preferred_option = next(
+        item
+        for item in second_snapshot.source_options
+        if item.node_id == preferred_node_id
+    )
+    assert not preferred_option.eligible
+    assert preferred_option.ineligible_reason == "exploration_quota_exhausted"
+
+    applied = runtime.apply_allocation_decision(
+        run_id,
+        decisions[0].decision_id,
+    )
+    child_task = applied["candidate_tasks"][0]
+    child_session = applied["agent_sessions"][0]
+    child_workspace = Path(child_task["workspace"])
+    adaptive = frozen.spec.strategy.adaptive_search
+    assert adaptive is not None
+
+    def current_resources():
+        graph = runtime._load_search_graph_projection(run_id)
+        assert graph is not None
+        return runtime._adaptive_search.project_resources(
+            adaptive,
+            graph,
+            runtime._load_candidate_records(run_id),
+            runtime._load_allocation_decisions(run_id),
+            max_candidates=6,
+        )
+
+    materialized_resources = current_resources()
+    assert materialized_resources.unobserved_expansions_by_node == {
+        preferred_node_id: 1,
+        second_expand.source.node_id: 1,
+    }
+    assert materialized_resources.exploration_quota_remaining_by_node[
+        preferred_node_id
+    ] == 0
+
+    child_workspace.joinpath("initial_program.py").write_text(
+        "VALUE = 5\n",
+        encoding="utf-8",
+    )
+    first_child_report = runtime.run_verifier(
+        run_id,
+        child_task["candidate_id"],
+        agent_session_id=child_session["agent_session_id"],
+        hypothesis="observe the derived candidate and release its source quota",
+    )
+    assert first_child_report.allocation_decision is None
+    observed_resources = current_resources()
+    assert observed_resources.unobserved_expansions_by_node.get(
+        preferred_node_id,
+        0,
+    ) == 0
+    assert observed_resources.exploration_quota_remaining_by_node[
+        preferred_node_id
+    ] == 1
 
 
 def test_allocation_error_does_not_block_annotation_task(

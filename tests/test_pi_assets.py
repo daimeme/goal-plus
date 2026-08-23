@@ -204,6 +204,11 @@ def test_pi_assets_document_runtime_owned_adaptive_allocation() -> None:
     assert "budget.max_candidates" in skill
     assert "discounted_mean_best" in skill
     assert "value_guided_replace" in skill
+    assert "max_unobserved_expansions_per_node" in skill
+    assert "expansion_action_context" in skill
+    assert "source_path_actions" in skill
+    assert "tried_actions" in skill
+    assert "action reservation" in skill
     assert "当前推荐的" in skill
     assert "兼容组合仍可使用" in skill
     assert "不按" in skill
@@ -220,15 +225,23 @@ def test_pi_assets_document_runtime_owned_adaptive_allocation() -> None:
     assert "allocation_decision" in worker
     assert '`context.orchestration_mode == "adaptive_search"`' in worker
     assert "独立持久化" in worker
+    assert "context.expansion_action_context" in worker
+    assert "不是指令" in worker
+    assert "description_source=hypothesis" in worker
     assert "异步 View 会在 worker 结束后继续生成" in worker
     assert 'Type.Literal("adaptive_search")' in extension
     assert "max_candidates: Type.Optional" in extension
     assert "const AdaptiveSearchSpec" in extension
     assert "value_backup: Type.Optional" in extension
+    assert (
+        "max_unobserved_expansions_per_node: "
+        "Type.Optional(NullablePositiveInteger)"
+    ) in extension
     assert "search_list_allocation_decisions: Type.Object" in extension
     assert "search_apply_allocation_decision: Type.Object" in extension
     assert "仅当当前 FrozenSpec 显式设置 orchestration_mode=adaptive_search" in extension
     assert "runtime 已返回准确 decision" in extension
+    assert "动态 expansion_action_context" in extension
     assert "workerAllocationDecisionId" in extension
     assert 'name === "search_run_verifier"' in extension
     main_tools = extension.split("const mainTools = [", 1)[1].split("];", 1)[0]

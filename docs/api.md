@@ -77,7 +77,12 @@ by allocation. V2 preserves negative attempt quality after a discard, while
 immutable `ValueBackupEvent` records are replayed along the actual transition
 ancestry into each node's mean, best, and backed-up value. A value-guided
 decision embeds the `AllocationStateSnapshot` used for its
-lane UCB and source priority. Legacy `reward` and `state_value` fields remain
+lane UCB, source priority, and optional unobserved-expansion quota state.
+`expansion.max_unobserved_expansions_per_node` limits the number of derived
+candidates from one source that may be awaiting their first verifier settlement.
+A persisted decision consumes the quota immediately; the child's first settlement
+releases it. This is an asynchronous exploration guard, not a lifetime branch
+limit. Legacy `reward` and `state_value` fields remain
 readable but are not written by new settlements.
 Before a decision becomes visible, its triggering iteration has completed Git
 and results-ledger settlement. Annotation task registration and reward/allocation
@@ -152,6 +157,16 @@ false, workers do not wait for or request supplemental evaluation. When enabled,
 `search_get_global_evidence` adds only `supplemental_available=true`; full summary,
 dimensions, peer comparisons, and limitations are
 fetched for a selected immutable row through `search_get_evidence_detail`.
+For a derived `adaptive_search` candidate in shared-Evidence mode, the response
+may also include `expansion_action_context`. Its `source_path_actions` and
+`tried_actions` are a read-time join of settled graph transitions and worker
+iterations. A completed objective View supplies the description; otherwise the
+bounded submitted hypothesis is used without waiting. Exact repeated effects are
+marked by source node plus artifact hash but remain separate observed transitions.
+Each action keeps the graph `transition_id` as the join key to `ValueProjection`;
+adaptive reward and backed values are not duplicated into worker context.
+The field is absent for initial candidates, `parallel_loops`, independent Evidence,
+and legacy runs without a usable graph projection.
 
 Worker process verifier calls require a one-line `hypothesis` describing the
 realized attempt. With `shared_dir` enabled they may also include a
@@ -316,6 +331,7 @@ goal-plus-pi-tool goal_plus_monitor_snapshot \
 | `strategy.adaptive_search.value_backup` | registered value-backup operator name/version/params |
 | `strategy.adaptive_search.allocation` | registered allocation policy name/version/params |
 | `strategy.adaptive_search.expansion` | source/model policy, depth cap, and optional derived-worker budget |
+| `strategy.adaptive_search.expansion.max_unobserved_expansions_per_node` | per-source cap on derived candidates awaiting their first verifier settlement |
 | `strategy.worker_host` | maintained execution host: `pi-rpc` or `codex` |
 | `strategy.worker_budget` | host-enforced upper bound and optional minimum lease |
 | `workspace.backend` | `git_worktree` (default) or `copy` |
